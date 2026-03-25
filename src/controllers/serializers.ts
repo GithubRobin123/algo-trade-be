@@ -1,0 +1,85 @@
+﻿import { StrategyPosition } from '../models/strategy-position.model';
+import { TradeIntent } from '../models/trade-intent.model';
+import { TradeOrder } from '../models/trade-order.model';
+import { UnderlyingInstrument } from '../types/trading.types';
+
+export const serializeOrder = (order: TradeOrder) => ({
+  id: Number(order.id),
+  provider: order.provider,
+  providerOrderId: order.providerOrderId,
+  side: order.side,
+  symbol: order.symbol,
+  instrumentKey: order.instrumentKey,
+  quantity: order.quantity,
+  product: order.product,
+  orderType: order.orderType,
+  validity: order.validity,
+  price: order.price !== null ? Number(order.price) : null,
+  triggerPrice: order.triggerPrice !== null ? Number(order.triggerPrice) : null,
+  status: order.status,
+  isPaper: order.isPaper,
+  errorMessage: order.errorMessage,
+  createdAt: order.createdAt?.toISOString() ?? null,
+  updatedAt: order.updatedAt?.toISOString() ?? null,
+});
+
+export const serializeIntent = (intent: TradeIntent) => ({
+  id: Number(intent.id),
+  source: intent.source,
+  status: intent.status,
+  side: intent.side,
+  symbol: intent.symbol,
+  instrumentKey: intent.instrumentKey,
+  quantity: intent.quantity,
+  orderType: intent.orderType,
+  product: intent.product,
+  validity: intent.validity,
+  price: intent.price !== null ? Number(intent.price) : null,
+  triggerPrice: intent.triggerPrice !== null ? Number(intent.triggerPrice) : null,
+  tag: intent.tag,
+  confidence: intent.confidence !== null ? Number(intent.confidence) : null,
+  rationale: intent.rationale,
+  requiresApproval: intent.requiresApproval,
+  approvedBy: intent.approvedBy,
+  approvedAt: intent.approvedAt?.toISOString() ?? null,
+  rejectedReason: intent.rejectedReason,
+  expiresAt: intent.expiresAt?.toISOString() ?? null,
+  executedOrderId: intent.executedOrderId,
+  metadata: intent.metadata,
+  createdAt: intent.createdAt?.toISOString() ?? null,
+  updatedAt: intent.updatedAt?.toISOString() ?? null,
+});
+
+export const serializePosition = (position: StrategyPosition) => ({
+  id: Number(position.id),
+  symbol: position.symbol,
+  instrumentKey: position.instrumentKey,
+  side: position.side,
+  quantity: position.quantity,
+  entryPrice: Number(position.entryPrice),
+  currentPrice: position.currentPrice !== null ? Number(position.currentPrice) : null,
+  stopLossPrice: Number(position.stopLossPrice),
+  targetPrice: Number(position.targetPrice),
+  trailActive: position.trailActive,
+  bestPrice: Number(position.bestPrice),
+  status: position.status,
+  openedOrderId: position.openedOrderId,
+  closedOrderId: position.closedOrderId,
+  exitReason: position.exitReason,
+  realizedPnl: position.realizedPnl !== null ? Number(position.realizedPnl) : null,
+  unrealizedPnl: position.unrealizedPnl !== null ? Number(position.unrealizedPnl) : null,
+  metadata: position.metadata,
+  createdAt: position.createdAt?.toISOString() ?? null,
+  updatedAt: position.updatedAt?.toISOString() ?? null,
+});
+
+export const serializeUnderlying = (underlying: UnderlyingInstrument) => ({
+  symbol: underlying.symbol,
+  displayName: underlying.displayName,
+  instrumentKey: underlying.instrumentKey,
+  optionChainInstrumentKey: underlying.optionChainInstrumentKey,
+  defaultLotSize: underlying.defaultLotSize,
+  assetClass: underlying.assetClass,
+  supportsOptions: underlying.supportsOptions,
+  intradayAllowed: underlying.intradayAllowed,
+});
