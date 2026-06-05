@@ -2,13 +2,14 @@
 import { ApiError } from '../middleware/error.middleware';
 import { UnderlyingInstrument } from '../types/trading.types';
 
+// NSE/BSE F&O lot sizes — updated April 2024
 const defaultUnderlyings: UnderlyingInstrument[] = [
   {
     symbol: 'NIFTY',
     displayName: 'NIFTY 50',
     instrumentKey: 'NSE_INDEX|Nifty 50',
     optionChainInstrumentKey: 'NSE_INDEX|Nifty 50',
-    defaultLotSize: 50,
+    defaultLotSize: 25,   // 1 lot = 25 units (revised Apr 2024)
     assetClass: 'INDEX',
     supportsOptions: true,
     intradayAllowed: true,
@@ -18,17 +19,67 @@ const defaultUnderlyings: UnderlyingInstrument[] = [
     displayName: 'NIFTY BANK',
     instrumentKey: 'NSE_INDEX|Nifty Bank',
     optionChainInstrumentKey: 'NSE_INDEX|Nifty Bank',
-    defaultLotSize: 15,
+    defaultLotSize: 15,   // 1 lot = 15 units
     assetClass: 'INDEX',
     supportsOptions: true,
     intradayAllowed: true,
   },
   {
     symbol: 'SENSEX',
-    displayName: 'SENSEX',
+    displayName: 'BSE SENSEX',
     instrumentKey: 'BSE_INDEX|SENSEX',
     optionChainInstrumentKey: 'BSE_INDEX|SENSEX',
-    defaultLotSize: 10,
+    defaultLotSize: 10,   // 1 lot = 10 units
+    assetClass: 'INDEX',
+    supportsOptions: true,
+    intradayAllowed: true,
+  },
+  {
+    symbol: 'FINNIFTY',
+    displayName: 'FIN NIFTY',
+    instrumentKey: 'NSE_INDEX|Nifty Fin Service',
+    optionChainInstrumentKey: 'NSE_INDEX|Nifty Fin Service',
+    defaultLotSize: 25,   // 1 lot = 25 units (revised 2024)
+    assetClass: 'INDEX',
+    supportsOptions: true,
+    intradayAllowed: true,
+  },
+  {
+    symbol: 'MIDCPNIFTY',
+    displayName: 'MIDCAP NIFTY',
+    instrumentKey: 'NSE_INDEX|NIFTY MID SELECT',
+    optionChainInstrumentKey: 'NSE_INDEX|NIFTY MID SELECT',
+    defaultLotSize: 50,   // 1 lot = 50 units
+    assetClass: 'INDEX',
+    supportsOptions: true,
+    intradayAllowed: true,
+  },
+  {
+    symbol: 'NIFTYNXT50',
+    displayName: 'NIFTY NEXT 50',
+    instrumentKey: 'NSE_INDEX|Nifty Next 50',
+    optionChainInstrumentKey: 'NSE_INDEX|Nifty Next 50',
+    defaultLotSize: 25,
+    assetClass: 'INDEX',
+    supportsOptions: false,   // limited options liquidity
+    intradayAllowed: true,
+  },
+  {
+    symbol: 'NIFTYIT',
+    displayName: 'NIFTY IT',
+    instrumentKey: 'NSE_INDEX|Nifty IT',
+    optionChainInstrumentKey: 'NSE_INDEX|Nifty IT',
+    defaultLotSize: 25,
+    assetClass: 'INDEX',
+    supportsOptions: false,
+    intradayAllowed: true,
+  },
+  {
+    symbol: 'BANKEX',
+    displayName: 'BSE BANKEX',
+    instrumentKey: 'BSE_INDEX|BANKEX',
+    optionChainInstrumentKey: 'BSE_INDEX|BANKEX',
+    defaultLotSize: 15,
     assetClass: 'INDEX',
     supportsOptions: true,
     intradayAllowed: true,
@@ -48,7 +99,7 @@ const defaultUnderlyings: UnderlyingInstrument[] = [
     displayName: 'RELIANCE',
     instrumentKey: 'NSE_EQ|INE002A01018',
     optionChainInstrumentKey: 'NSE_EQ|INE002A01018',
-    defaultLotSize: 1,
+    defaultLotSize: 250,  // 1 lot = 250 shares (revised 2024)
     assetClass: 'STOCK',
     supportsOptions: true,
     intradayAllowed: true,

@@ -31,6 +31,15 @@ export interface AiDecisionParams {
   vwap: number;
   volumeRatio: number;
 
+  // New: trend-strength and momentum indicators
+  atr14?: number;                            // ATR(14) of underlying
+  adx14?: number;                            // ADX(14) — trend strength 0-100
+  supertrendDirection?: 'BULLISH' | 'BEARISH' | null;  // Supertrend signal
+  bbPercentB?: number;                       // Bollinger %B: 0=at lower, 1=at upper
+  bbBandwidth?: number;                      // BB bandwidth % (squeeze if < 0.8)
+  stochK?: number;                           // Stochastic %K
+  stochD?: number;                           // Stochastic %D
+
   // Market structure
   dayHigh: number;
   dayLow: number;
@@ -77,18 +86,32 @@ const SYSTEM_PROMPT = `You are a quantitative options analyst specialising in In
 You analyse intraday 5-minute setups and return a probability score for a directional trade.
 
 The trader ONLY buys options (CALL or PUT) — never selling/writing.
-Holding period: intraday only (minutes to a few hours), hard 2% trailing stop loss on option premium.
+Holding period: intraday only (minutes to a few hours).
 Square-off before 3:15 PM IST.
 
 INDIAN MARKET CONTEXT:
 - Nifty options: 50-point strike intervals, lot size 75
 - Sensex options: 100-point strike intervals, lot size 10
-- VWAP is the most important intraday level
-- Theta decay accelerates after 2 PM IST — penalise late entries
-- Weekly expiry: NEVER buy on expiry day (avoid extreme theta)
-- VIX > 22 = elevated volatility — widen your uncertainty, lower probability
-- PCR > 1.2 = market is net-hedged bearishly, potential for bullish bounce
+- VWAP is the most critical intraday level — price above VWAP = bullish bias
+- Theta decay accelerates after 2 PM IST — penalise late entries strongly
+- Weekly expiry: NEVER buy on expiry day (extreme theta)
+- VIX > 22 = elevated volatility — lower probability, wider uncertainty
+- PCR > 1.2 = market net-hedged, potential bullish squeeze
 - PCR < 0.8 = under-hedged, vulnerable to sell-off
+
+INDICATOR INTERPRETATION:
+- ADX > 25 = strong trend, signals are more reliable; ADX < 20 = choppy, avoid trend strategies
+- Supertrend BULLISH + price above VWAP = high-conviction long setup
+- Supertrend BEARISH + price below VWAP = high-conviction short setup
+- BB %B > 0.95 = overbought (consider PUT); BB %B < 0.05 = oversold (consider CALL)
+- BB bandwidth < 0.8% = squeeze (imminent breakout); > 2% = already expanded
+- Stochastic < 20 with %K crossing above %D = oversold reversal (bullish)
+- Stochastic > 80 with %K crossing below %D = overbought reversal (bearish)
+- ATR helps size stop loss — high ATR means more room needed, reduce position confidence
+
+MULTI-FACTOR SCORING:
+Reward setups where 4+ indicators agree. Penalise conflicting setups heavily.
+A STRONG entry needs: trend alignment (EMA/Supertrend) + momentum (MACD/Stoch) + confirmation (VWAP/PCR).
 
 RESPONSE FORMAT — return ONLY valid JSON with no preamble, no markdown fences:
 {
@@ -113,7 +136,6 @@ function buildUserPrompt(p: AiDecisionParams): string {
   const pcrNote = p.pcrRatio > 1.2 ? 'HIGH PCR — market net-hedged, potential bullish squeeze'
     : p.pcrRatio < 0.8 ? 'LOW PCR — market under-hedged, watch for sell-off'
     : 'Neutral PCR';
-  const slLevel = (p.optionPremium * 0.98).toFixed(1);
   const rsiNote = p.rsi14 < 35 ? ' ← OVERSOLD' : p.rsi14 > 65 ? ' ← OVERBOUGHT' : '';
   const volNote = p.volumeRatio > 1.5 ? ` ← HIGH VOLUME SPIKE (${p.volumeRatio.toFixed(1)}x)` : '';
   const vixNote = p.indiaVix > 22 ? ` ← ELEVATED VIX (${p.indiaVix})` : '';
@@ -121,13 +143,36 @@ function buildUserPrompt(p: AiDecisionParams): string {
     ? (((p.currentPrice - p.dayLow) / (p.dayHigh - p.dayLow)) * 100).toFixed(0)
     : '50';
 
+  // New indicators section
+  const adxNote = p.adx14 != null
+    ? `ADX(14)   : ${p.adx14.toFixed(0)}${p.adx14 > 25 ? ' ← TRENDING (signals reliable)' : p.adx14 < 20 ? ' ← RANGING/CHOPPY' : ''}`
+    : '';
+  const stNote = p.supertrendDirection != null
+    ? `Supertrend: ${p.supertrendDirection}${p.supertrendDirection === 'BULLISH' ? ' ← UPTREND confirmed' : ' ← DOWNTREND confirmed'}`
+    : '';
+  const bbNote = p.bbPercentB != null
+    ? `BB %B      : ${(p.bbPercentB * 100).toFixed(0)}%${p.bbPercentB < 0.05 ? ' ← AT LOWER BAND (oversold)' : p.bbPercentB > 0.95 ? ' ← AT UPPER BAND (overbought)' : ''}${p.bbBandwidth != null && p.bbBandwidth < 0.8 ? '  BB SQUEEZE active' : ''}`
+    : '';
+  const stochNote = (p.stochK != null && p.stochD != null)
+    ? `Stoch %K/%D: ${p.stochK.toFixed(0)}/${p.stochD.toFixed(0)}${p.stochK < 20 ? ' ← OVERSOLD' : p.stochK > 80 ? ' ← OVERBOUGHT' : ''}`
+    : '';
+  const atrNote = p.atr14 != null
+    ? `ATR(14)   : ${p.atr14.toFixed(1)} pts (${((p.atr14 / p.currentPrice) * 100).toFixed(2)}% of index)`
+    : '';
+
+  const newIndicators = [adxNote, stNote, bbNote, stochNote, atrNote]
+    .filter(Boolean).map(l => `  ${l}`).join('\n');
+
+  const slPct = p.atr14 ? Math.min(30, Math.max(10, (p.atr14 / p.currentPrice) * 250)) : 20;
+  const slLevel = (p.optionPremium * (1 - slPct / 100)).toFixed(1);
+
   return `TRADE SETUP ANALYSIS — ${p.index}
 
 PROPOSED TRADE:
   Action    : BUY ${p.optionType} option
   ATM Strike: ${p.atmStrike}
   Premium   : ₹${p.optionPremium}
-  Hard SL   : ₹${slLevel} (2% trailing stop on premium)
+  ATR-based SL: ₹${slLevel} (~${slPct.toFixed(0)}% stop on premium)
   Time      : ${p.timeIST} IST (${p.minutesToClose} min to 3:15 close)
   India VIX : ${p.indiaVix}${vixNote}
 
@@ -141,6 +186,7 @@ TECHNICAL INDICATORS (5-min chart):
   MACD      : ${p.macd.toFixed(2)}, Signal: ${p.macdSignal.toFixed(2)}, Hist: ${p.macdHistogram.toFixed(2)}
   ${emaStructure}
   Volume    : ${p.volumeRatio.toFixed(1)}x average${volNote}
+${newIndicators ? '\nADVANCED INDICATORS:\n' + newIndicators : ''}
 
 OPTION CHAIN:
   ATM Call OI : ${(p.atmCallOI / 100000).toFixed(1)} lakh contracts
@@ -148,7 +194,7 @@ OPTION CHAIN:
   PCR (near ATM): ${p.pcrRatio.toFixed(2)} — ${pcrNote}
   IV Percentile : ${p.ivPercentile}%${p.ivPercentile > 80 ? ' ← EXPENSIVE premium' : p.ivPercentile < 20 ? ' ← CHEAP premium' : ''}
 
-Given all the above, what is the probability this BUY ${p.optionType} entry will be profitable with a 2% trailing stop loss?`;
+Given all the above (especially ADX trend strength, Supertrend, VWAP bias, and RSI), what is the probability this BUY ${p.optionType} entry will be profitable intraday?`;
 }
 
 // ── Provider adapters ─────────────────────────────────────────────────────
@@ -455,18 +501,83 @@ export function computeRuleBasedDecision(params: AiDecisionParams): RuleBasedRes
     signals.push(`Low PCR ${params.pcrRatio.toFixed(2)} — bearish risk`);
   }
 
+  // ── Supertrend ——————————————————————————————————————————————————————
+  // Highest-weight new indicator: Supertrend aligns with trend AND confirms entry
+  if (params.supertrendDirection === 'BULLISH') {
+    bullScore += 20;
+    signals.push('Supertrend BULLISH — trend confirmed upward');
+  } else if (params.supertrendDirection === 'BEARISH') {
+    bearScore += 20;
+    signals.push('Supertrend BEARISH — trend confirmed downward');
+  }
+
+  // ── ADX — trend strength gate ────────────────────────────────────────
+  // ADX > 25: multiply directional scores (trending market = more reliable signals)
+  // ADX < 20: discount all signals (choppy/ranging = false signals)
+  if (params.adx14 != null) {
+    if (params.adx14 > 25) {
+      // Trending: boost whichever direction is leading
+      const boost = Math.min(15, Math.round((params.adx14 - 25) * 0.5));
+      if (bullScore > bearScore) {
+        bullScore += boost;
+        signals.push(`ADX=${params.adx14.toFixed(0)} trending — bull boost +${boost}`);
+      } else {
+        bearScore += boost;
+        signals.push(`ADX=${params.adx14.toFixed(0)} trending — bear boost +${boost}`);
+      }
+    } else if (params.adx14 < 20) {
+      // Choppy: discount both sides
+      bullScore = Math.round(bullScore * 0.8);
+      bearScore = Math.round(bearScore * 0.8);
+      signals.push(`ADX=${params.adx14.toFixed(0)} — choppy market, signals discounted`);
+    }
+  }
+
+  // ── Bollinger Band position ──────────────────────────────────────────
+  if (params.bbPercentB != null) {
+    if (params.bbPercentB <= 0.05) {
+      bullScore += 15;
+      signals.push(`BB %B=${(params.bbPercentB * 100).toFixed(0)}% — price at lower band (oversold)`);
+    } else if (params.bbPercentB >= 0.95) {
+      bearScore += 15;
+      signals.push(`BB %B=${(params.bbPercentB * 100).toFixed(0)}% — price at upper band (overbought)`);
+    }
+    // BB squeeze: upcoming breakout — don't add directional score but flag it
+    if (params.bbBandwidth != null && params.bbBandwidth < 0.8) {
+      signals.push(`BB squeeze (bandwidth=${params.bbBandwidth.toFixed(2)}%) — breakout imminent`);
+    }
+  }
+
+  // ── Stochastic ──────────────────────────────────────────────────────
+  if (params.stochK != null && params.stochD != null) {
+    if (params.stochK < 20 && params.stochK > params.stochD) {
+      bullScore += 12;
+      signals.push(`Stoch bullish cross in oversold zone (%K=${params.stochK.toFixed(0)})`);
+    } else if (params.stochK > 80 && params.stochK < params.stochD) {
+      bearScore += 12;
+      signals.push(`Stoch bearish cross in overbought zone (%K=${params.stochK.toFixed(0)})`);
+    }
+  }
+
   // ── VIX filter — high VIX weakens all signals ───────────────────────
   if (params.indiaVix > 22) {
     bullScore = Math.round(bullScore * 0.75);
     bearScore = Math.round(bearScore * 0.75);
-    signals.push(`VIX ${params.indiaVix} — signals discounted`);
+    signals.push(`VIX ${params.indiaVix} — signals discounted 25%`);
   }
 
   // ── Time filter — late entries have theta risk ──────────────────────
   if (params.minutesToClose < 60) {
     bullScore = Math.round(bullScore * 0.7);
     bearScore = Math.round(bearScore * 0.7);
-    signals.push(`< 60 min to close — premium decay risk`);
+    signals.push(`< 60 min to close — theta decay risk, 30% penalty`);
+  }
+
+  // ── IV filter — don't buy when premium is very expensive ────────────
+  if (params.ivPercentile > 85) {
+    bullScore = Math.round(bullScore * 0.85);
+    bearScore = Math.round(bearScore * 0.85);
+    signals.push(`IV percentile ${params.ivPercentile}% — premium expensive, 15% penalty`);
   }
 
   // ── Normalise to 0-100 ──────────────────────────────────────────────
@@ -476,8 +587,8 @@ export function computeRuleBasedDecision(params: AiDecisionParams): RuleBasedRes
 
   const signalCount = signals.length;
   const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
-    signalCount >= 4 && Math.max(buyPct, bearPct) >= 75 ? 'HIGH'
-    : signalCount >= 2 && Math.max(buyPct, bearPct) >= 60 ? 'MEDIUM'
+    signalCount >= 5 && Math.max(buyPct, bearPct) >= 75 ? 'HIGH'
+    : signalCount >= 3 && Math.max(buyPct, bearPct) >= 60 ? 'MEDIUM'
     : 'LOW';
 
   const minPct = env.aiMinProbabilityPct;

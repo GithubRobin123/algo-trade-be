@@ -10,9 +10,10 @@ const app = express();
 const corsOrigin = env.frontendUrl === '*' ? true : env.frontendUrl;
 
 app.use(cors({
-  origin:  '*',//corsOrigin,
+  origin: corsOrigin,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
 }));
 
 app.use(helmet());

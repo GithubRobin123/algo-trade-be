@@ -93,9 +93,9 @@ class TokenService {
     }
 
     return {
-      connected: true,
-      expiresAt: '2026-03-15',
-      tokenType: 'any',
+      connected: false,
+      expiresAt: null,
+      tokenType: null,
       scope: null,
       source: 'none',
     };

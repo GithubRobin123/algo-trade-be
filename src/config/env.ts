@@ -51,8 +51,9 @@ const getBoolean = (key: string, fallback: boolean): boolean => {
 export const env = {
   nodeEnv: getString('NODE_ENV', 'development'),
   port: getNumber('PORT', 4000),
+  // Fallbacks are local-dev only — in production these MUST be set via Render env vars
   frontendUrl: getString('FRONTEND_URL', 'http://localhost:5173'),
-  databaseUrl: getString('DATABASE_URL', 'postgres://upstox:upstox@localhost:5432/upstox_trading'),
+  databaseUrl: getString('DATABASE_URL', 'postgres://postgres:postgres@localhost:5432/upstox_trading'),
   dbLogging: getBoolean('DB_LOGGING', false),
 
   upstoxApiBaseUrl: getString('UPSTOX_API_BASE_URL', 'https://api.upstox.com'),

@@ -22,7 +22,13 @@ export interface UnderlyingInstrument {
   intradayAllowed: boolean;
 }
 
-export type StrategySource = 'SMA_PCR' | 'VWAP_BOUNCE' | 'EMA_CROSS';
+export type StrategySource =
+  | 'SMA_PCR'
+  | 'VWAP_BOUNCE'
+  | 'EMA_CROSS'
+  | 'SUPERTREND'
+  | 'BOLLINGER_BREAKOUT'
+  | 'STOCHASTIC_MOMENTUM';
 
 export interface StrategySignal {
   source: StrategySource;

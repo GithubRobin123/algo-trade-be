@@ -38,6 +38,109 @@ const resolveUnderlyingForOption = (req: Request): string => {
   return symbol ?? instrument ?? underlyingService.getActive().symbol;
 };
 
+// Simple in-memory cache for overview — refreshed only during market hours
+let overviewCache: { data: unknown[]; cachedAt: number } | null = null;
+
+// Batch LTP for the market overview bar — all popular indices in one call
+export const getMarketOverview = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { tokenService } = await import('../services/token.service');
+    const { upstoxService } = await import('../services/upstox.service');
+    const { underlyingService } = await import('../services/underlying.service');
+    const { isMarketOpen } = await import('../services/market-data.service');
+
+    // When market is closed, serve cached data (no Upstox API calls)
+    if (!isMarketOpen()) {
+      if (overviewCache) {
+        res.json({ success: true, data: overviewCache.data, marketOpen: false, cachedAt: new Date(overviewCache.cachedAt).toISOString() });
+        return;
+      }
+      // No cache yet — fetch once and cache it
+    }
+
+    const accessToken = await tokenService.getValidAccessToken();
+    const allUnderlyings = underlyingService.list();
+
+    // Fetch current LTP for all instruments in parallel
+    const ltpResults = await Promise.allSettled(
+      allUnderlyings.map((u) => upstoxService.getNiftyLtp(accessToken, u.instrumentKey)),
+    );
+
+    // Get today's first stored tick per instrument (used as day-open for change calc)
+    const { MarketTick } = await import('../models/market-tick.model');
+    const { Op } = await import('sequelize');
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
+    const firstTicks = await MarketTick.findAll({
+      attributes: ['instrumentKey', 'ltp'],
+      where: { sourceTimestamp: { [Op.gte]: todayStart } } as never,
+      order: [['sourceTimestamp', 'ASC']],
+    });
+    const dayOpenMap: Record<string, number> = {};
+    for (const tick of firstTicks) {
+      if (!(tick.instrumentKey in dayOpenMap)) {
+        dayOpenMap[tick.instrumentKey] = Number(tick.ltp);
+      }
+    }
+
+    const overview = allUnderlyings.map((u, idx) => {
+      const ltpResult = ltpResults[idx];
+      const ltp = ltpResult.status === 'fulfilled' ? ltpResult.value.ltp : null;
+      const dayOpen = dayOpenMap[u.instrumentKey] ?? null;
+      const change = ltp != null && dayOpen != null && dayOpen > 0 ? ltp - dayOpen : null;
+      const changePct = change != null && dayOpen != null && dayOpen > 0 ? (change / dayOpen) * 100 : null;
+      return {
+        symbol: u.symbol,
+        displayName: u.displayName,
+        instrumentKey: u.instrumentKey,
+        assetClass: u.assetClass,
+        supportsOptions: u.supportsOptions,
+        defaultLotSize: u.defaultLotSize,
+        ltp,
+        prevClose: dayOpen,
+        change,
+        changePct,
+      };
+    });
+
+    // Cache the result
+    overviewCache = { data: overview, cachedAt: Date.now() };
+
+    res.json({ success: true, data: overview, marketOpen: isMarketOpen() });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Fetch live LTP for any arbitrary instrument key (e.g. NSE_FO|NIFTY...CE)
+export const getInstrumentLtp = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const rawKey = typeof req.query.instrumentKey === 'string' ? req.query.instrumentKey.trim() : null;
+    if (!rawKey) {
+      res.status(400).json({ success: false, message: 'instrumentKey query param required' });
+      return;
+    }
+
+    const { tokenService } = await import('../services/token.service');
+    const { upstoxService } = await import('../services/upstox.service');
+    const accessToken = await tokenService.getValidAccessToken();
+    const quote = await upstoxService.getNiftyLtp(accessToken, rawKey);
+
+    res.json({
+      success: true,
+      data: {
+        instrumentKey: rawKey,
+        symbol: quote.symbol,
+        ltp: quote.ltp,
+        sourceTimestamp: quote.timestamp,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const getNiftyLivePrice = async (
   req: Request,
   res: Response,
@@ -80,13 +183,9 @@ export const getNiftyHistory = async (req: Request, res: Response, next: NextFun
   }
 };
 
+
 export const getOptionChain = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-
-
-    console.log('req.query', req.query);
-    
-
     const expiryDate = typeof req.query.expiryDate === 'string' ? req.query.expiryDate : undefined;
     const shouldRefresh = parseBoolean(req.query.refresh, false);
     const symbolOrInstrument = resolveUnderlyingForOption(req);

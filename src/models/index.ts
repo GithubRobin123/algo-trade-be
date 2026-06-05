@@ -1,4 +1,5 @@
 import { sequelize } from '../config/database';
+import { initCandleModel } from './candle.model';
 import { initMarketTickModel } from './market-tick.model';
 import { initOAuthTokenModel } from './oauth-token.model';
 import { initOptionChainSnapshotModel } from './option-chain-snapshot.model';
@@ -14,13 +15,13 @@ import { initWatchlistItemModel } from './watchlist-item.model';
 export const initModels = (): void => {
   initOAuthTokenModel(sequelize);
   initMarketTickModel(sequelize);
+  initCandleModel(sequelize);
   initOptionChainSnapshotModel(sequelize);
   initTradeOrderModel(sequelize);
   initTradeIntentModel(sequelize);
   initStrategyPositionModel(sequelize);
   initStockInstrumentModel(sequelize);
   initWatchlistItemModel(sequelize);
-  // New: decision audit log + per-position PnL ticks
   initStrategyDecisionLogModel(sequelize);
   initPositionPnlTickModel(sequelize);
   initTradeEventLogModel(sequelize);

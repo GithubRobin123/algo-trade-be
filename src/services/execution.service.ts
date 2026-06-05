@@ -20,10 +20,14 @@ import { env } from '../config/env';
 import { PositionPnlTick } from '../models/position-pnl-tick.model';
 import { StrategyPosition } from '../models/strategy-position.model';
 import { TradeIntent } from '../models/trade-intent.model';
+import { TradeOrder } from '../models/trade-order.model';
 import { tokenService } from './token.service';
 import { tradeEventService } from './trade-event.service';
 import { tradeIntentService } from './trade-intent.service';
 import { upstoxService } from './upstox.service';
+import { marketDataService } from './market-data.service';
+import { websocketService } from './websocket.service';
+import { atr, ema, rsi, macd, supertrend } from './strategy-registry.service';
 
 // ── EOD square-off time: 3:10 PM IST (5 min before market close) ──────────
 const EOD_SQUAREOFF_HOUR = 15;
@@ -76,6 +80,96 @@ class ExecutionService {
 
   resetEodFlag(): void {
     this.eodSquaredOff = false;
+  }
+
+  /**
+   * EMERGENCY EXIT — closes EVERY open position immediately.
+   * Bypasses ALL strategy logic, gates, and cooldowns.
+   * Also cancels any open/pending orders at broker level.
+   *
+   * Use cases:
+   *   - User-triggered panic button from UI
+   *   - System detects unrecoverable error
+   *   - API disconnect detected and reconnect failed
+   *
+   * Returns: count of positions closed and any errors.
+   */
+  async emergencyExitAll(triggeredBy: string): Promise<{
+    closedCount: number;
+    failedCount: number;
+    errors: string[];
+  }> {
+    const errors: string[] = [];
+    let closedCount = 0;
+    let failedCount = 0;
+
+    process.stderr.write(`[EMERGENCY_EXIT] Triggered by: ${triggeredBy}\n`);
+
+    // 1. Pause strategy engine immediately so no new trades open
+    // (caller should also call strategyService.setEnabled(false) at API layer)
+
+    // 2. Cancel all pending/open broker orders first
+    try {
+      const accessToken = await tokenService.getValidAccessToken().catch(() => null);
+      if (accessToken) {
+        await upstoxService.cancelAllOrders(accessToken);
+        process.stderr.write('[EMERGENCY_EXIT] Broker orders cancelled.\n');
+      }
+    } catch (err) {
+      errors.push('Cancel broker orders failed: ' + String(err));
+    }
+
+    // 3. Reject all pending-approval intents so they can't be approved later
+    try {
+      const pending = await TradeIntent.findAll({ where: { status: 'PENDING_APPROVAL' } });
+      for (const intent of pending) {
+        intent.status = 'REJECTED';
+        await intent.save();
+      }
+    } catch (err) {
+      errors.push('Rejecting pending intents failed: ' + String(err));
+    }
+
+    // 4. Force-close every open strategy position
+    const openPositions = await StrategyPosition.findAll({ where: { status: 'OPEN' } });
+
+    await tradeEventService.emit({
+      type: 'EOD_SQUAREOFF_START',
+      underlying: 'ALL',
+      reason: `EMERGENCY EXIT by ${triggeredBy} — closing ${openPositions.length} positions`,
+      metadata: { triggeredBy, count: openPositions.length, isEmergency: true },
+    });
+
+    for (const pos of openPositions) {
+      const underlying = pos.symbol.split('-')[0] ?? pos.symbol;
+      try {
+        await this.closePositionWithEvent(Number(pos.id), `EMERGENCY_EXIT:${triggeredBy}`, underlying);
+        closedCount++;
+      } catch (err) {
+        failedCount++;
+        const msg = `Failed to close position ${pos.id} (${pos.symbol}): ${String(err)}`;
+        errors.push(msg);
+        process.stderr.write('[EMERGENCY_EXIT] ' + msg + '\n');
+
+        // Even if close fails: mark the DB record as CLOSED to prevent further monitoring
+        try {
+          pos.status = 'CLOSED';
+          pos.exitReason = `EMERGENCY_EXIT_FORCED:${triggeredBy}`;
+          await pos.save();
+        } catch { /* DB also failed — nothing we can do */ }
+      }
+    }
+
+    await tradeEventService.emit({
+      type: 'EOD_SQUAREOFF_DONE',
+      underlying: 'ALL',
+      reason: `EMERGENCY EXIT complete — ${closedCount} closed, ${failedCount} failed`,
+      metadata: { triggeredBy, closedCount, failedCount, errors, isEmergency: true },
+    });
+
+    process.stderr.write(`[EMERGENCY_EXIT] Done. Closed: ${closedCount}, Failed: ${failedCount}\n`);
+
+    return { closedCount, failedCount, errors };
   }
 
   // ── Auto-execute pending intents ─────────────────────────────────────
@@ -254,6 +348,24 @@ class ExecutionService {
     position.unrealizedPnl = unrealizedPnl;
     position.bestPrice = newBestPrice;
 
+    // Push live P&L to frontend via WebSocket immediately (no polling needed)
+    websocketService.broadcast('position_update', {
+      id: Number(position.id),
+      symbol: position.symbol,
+      instrumentKey: position.instrumentKey,
+      side: position.side,
+      quantity: position.quantity,
+      entryPrice: Number(position.entryPrice),
+      currentPrice: ltp,
+      unrealizedPnl,
+      unrealizedPnlPct: pnlPct,
+      stopLossPrice: Number(position.stopLossPrice),
+      targetPrice: Number(position.targetPrice),
+      trailActive: position.trailActive,
+      bestPrice: newBestPrice,
+      status: position.status,
+    });
+
     // Trailing SL logic
     let slUpdated = false;
     if (pnlPct >= env.strategyTrailActivationPct) {
@@ -338,7 +450,107 @@ class ExecutionService {
 
     if (targetHit || pnlPct >= env.strategyProfitTargetPct) {
       await this.closePositionWithEvent(Number(position.id), 'TARGET_HIT', underlying);
+      return;
     }
+
+    // Technical reversal check — exit early if trend has reversed against us
+    // Only fires when pnlPct > 5% to avoid noise exits on small moves
+    try {
+      const reversal = await this.checkTechnicalReversal(position, ltp, pnlPct);
+      if (reversal.shouldExit) {
+        await this.closePositionWithEvent(Number(position.id), reversal.reason, underlying);
+      }
+    } catch {
+      // Non-critical — skip if reversal check fails
+    }
+  }
+
+  // ── Technical reversal detector ───────────────────────────────────────
+  /**
+   * Checks whether the underlying's trend has reversed against the open position.
+   * Only triggers when the position has some profit locked in (pnlPct > 5%)
+   * to avoid premature exits on normal price noise.
+   *
+   * Exit signals checked:
+   *   1. Supertrend flipped against position direction
+   *   2. EMA death cross (9 < 21) while LONG; golden cross while SHORT
+   *   3. RSI extreme exhaustion (> 82 while long, < 18 while short)
+   *   4. MACD histogram reversal (histogram turned against position for 2+ ticks)
+   */
+  private async checkTechnicalReversal(
+    position: StrategyPosition,
+    ltp: number,
+    pnlPct: number,
+  ): Promise<{ shouldExit: boolean; reason: string }> {
+    // Only intervene when we have meaningful profit (avoid noise exits)
+    if (pnlPct < 5) return { shouldExit: false, reason: '' };
+
+    const underlying = position.symbol.split('-')[0] ?? position.symbol;
+    let prices: number[];
+
+    try {
+      // Get underlying index price history (not option prices)
+      const underlyingKey = position.metadata
+        ? (position.metadata as Record<string, unknown>).underlyingInstrumentKey as string | undefined
+        : undefined;
+      const history = await marketDataService.getTickHistory(50, underlyingKey);
+      if (history.length < 25) return { shouldExit: false, reason: '' };
+      prices = history.map((t) => t.ltp);
+    } catch {
+      return { shouldExit: false, reason: '' };
+    }
+
+    const isLong = position.side === 'BUY'; // BUY = long option (call or put)
+    const isBullishPosition = position.symbol.endsWith('-CE'); // CE = expecting up move
+
+    // 1. Supertrend reversal
+    const stDir = supertrend(prices, 10, 3.0);
+    if (stDir) {
+      const stBullish = stDir === 'BULLISH';
+      if (isBullishPosition && !stBullish) {
+        return { shouldExit: true, reason: `TECH_REVERSAL: Supertrend flipped BEARISH while long CE (pnl=${pnlPct.toFixed(1)}%)` };
+      }
+      if (!isBullishPosition && stBullish) {
+        return { shouldExit: true, reason: `TECH_REVERSAL: Supertrend flipped BULLISH while long PE (pnl=${pnlPct.toFixed(1)}%)` };
+      }
+    }
+
+    // 2. EMA cross reversal — only trigger on confirmed cross
+    const ema9Now = ema(prices, 9);
+    const ema21Now = ema(prices, 21);
+    const ema9Prev = ema(prices.slice(0, -2), 9);
+    const ema21Prev = ema(prices.slice(0, -2), 21);
+    const deathCross = ema9Prev > ema21Prev && ema9Now < ema21Now;
+    const goldenCross = ema9Prev < ema21Prev && ema9Now > ema21Now;
+    if (isBullishPosition && deathCross) {
+      return { shouldExit: true, reason: `TECH_REVERSAL: EMA death cross while long CE (pnl=${pnlPct.toFixed(1)}%)` };
+    }
+    if (!isBullishPosition && goldenCross) {
+      return { shouldExit: true, reason: `TECH_REVERSAL: EMA golden cross while long PE (pnl=${pnlPct.toFixed(1)}%)` };
+    }
+
+    // 3. RSI exhaustion — only exit at extreme levels
+    const rsi14 = rsi(prices, 14);
+    if (isBullishPosition && rsi14 > 82) {
+      return { shouldExit: true, reason: `TECH_REVERSAL: RSI exhaustion ${rsi14.toFixed(0)} while long CE (pnl=${pnlPct.toFixed(1)}%)` };
+    }
+    if (!isBullishPosition && rsi14 < 18) {
+      return { shouldExit: true, reason: `TECH_REVERSAL: RSI exhaustion ${rsi14.toFixed(0)} while long PE (pnl=${pnlPct.toFixed(1)}%)` };
+    }
+
+    // 4. MACD histogram reversal (consecutive ticks against position)
+    const { histogram: histNow } = macd(prices);
+    const { histogram: histPrev } = macd(prices.slice(0, -2));
+    const macdTurningAgainstLong = isBullishPosition && histNow < 0 && histPrev > 0;
+    const macdTurningAgainstShort = !isBullishPosition && histNow > 0 && histPrev < 0;
+    if (macdTurningAgainstLong && pnlPct > 12) {
+      return { shouldExit: true, reason: `TECH_REVERSAL: MACD histogram crossed below zero while long CE (pnl=${pnlPct.toFixed(1)}%)` };
+    }
+    if (macdTurningAgainstShort && pnlPct > 12) {
+      return { shouldExit: true, reason: `TECH_REVERSAL: MACD histogram crossed above zero while long PE (pnl=${pnlPct.toFixed(1)}%)` };
+    }
+
+    return { shouldExit: false, reason: '' };
   }
 
   // ── Close position + emit event ───────────────────────────────────────
@@ -383,6 +595,24 @@ class ExecutionService {
       position.realizedPnl = realizedPnl;
       position.unrealizedPnl = 0;
       await position.save();
+
+      // Notify frontend immediately so P&L panel disappears without polling
+      websocketService.broadcast('position_update', {
+        id: Number(position.id),
+        symbol: position.symbol,
+        instrumentKey: position.instrumentKey,
+        side: position.side,
+        quantity: position.quantity,
+        entryPrice: Number(position.entryPrice),
+        currentPrice: lastPrice,
+        unrealizedPnl: 0,
+        unrealizedPnlPct: 0,
+        stopLossPrice: Number(position.stopLossPrice),
+        targetPrice: Number(position.targetPrice),
+        trailActive: position.trailActive,
+        bestPrice: Number(position.bestPrice),
+        status: 'CLOSED',
+      });
 
       await tradeEventService.emit({
         type: 'POSITION_CLOSED',

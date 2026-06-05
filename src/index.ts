@@ -11,7 +11,7 @@ import { websocketService } from './services/websocket.service';
 const bootstrap = async (): Promise<void> => {
   initModels();
   await connectDatabase();
-  await sequelize.sync();
+  await sequelize.sync(); // creates new tables (candles); leaves existing tables untouched
   await stockCatalogService.ensureSeeded();
 
   const server = http.createServer(app);
@@ -21,7 +21,8 @@ const bootstrap = async (): Promise<void> => {
   strategyService.start();
 
   server.listen(env.port, () => {
-    console.log(`Backend running on http://localhost:${env.port}`);
+    const host = process.env.NODE_ENV === 'production' ? '0.0.0.0' : 'localhost';
+    console.log(`Backend running on http://${host}:${env.port}`);
   });
 
   const shutdown = async (): Promise<void> => {

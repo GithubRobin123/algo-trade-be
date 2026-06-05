@@ -6,14 +6,18 @@
  *
  * Flow per cycle:
  *   1. Risk gate
- *   2. Pending-intent guard
- *   3. Time / expiry filters
- *   4. Fetch market data + option chain
- *   5. Run all strategies via registry (SMA_PCR, VWAP_BOUNCE, EMA_CROSS)
- *   6. Rule-based probability pre-check
- *   7. AI confidence check (optional)
- *   8. Create TradeIntent → hand off to execution.service
- *   9. Log every outcome to strategy_decision_logs
+ *   2. Pending-intent guard  (also guards against concurrent open positions)
+ *   3. Signal cooldown guard (5 min between consecutive signals — prevents burst entries)
+ *   4. Time / expiry filters
+ *   5. Build market context from candles (primary) or session ticks (fallback)
+ *   6. Compute PCR from ±10 ATM strikes (wider, more representative)
+ *   7. Wire real ATM call/put OI and IV from chain
+ *   8. Use live India VIX (fetched alongside Nifty poll)
+ *   9. Run strategy registry
+ *  10. Rule-based probability pre-check
+ *  11. AI confidence check (optional)
+ *  12. Create TradeIntent → hand off to execution.service
+ *  13. Log every outcome to strategy_decision_logs
  */
 
 import { Op, col, where as sqlWhere } from 'sequelize';
@@ -21,6 +25,7 @@ import { env } from '../config/env';
 import { ApiError } from '../middleware/error.middleware';
 import { StrategyDecisionLog, RejectionCategory } from '../models/strategy-decision-log.model';
 import { StrategyPosition } from '../models/strategy-position.model';
+import { PositionPnlTick } from '../models/position-pnl-tick.model';
 import { TradeIntent } from '../models/trade-intent.model';
 import { StrategyRiskSnapshot, StrategySignal } from '../types/trading.types';
 import {
@@ -30,8 +35,8 @@ import {
   getAiTradeDecision,
 } from './ai-decision.service';
 import { executionService } from './execution.service';
-import { marketDataService } from './market-data.service';
-import { StrategyContext, strategyRegistry } from './strategy-registry.service';
+import { isMarketOpen, marketDataService, getLatestVix } from './market-data.service';
+import { StrategyContext, strategyRegistry, atr, supertrend, adx, bollingerBands, stochastic } from './strategy-registry.service';
 import { tokenService } from './token.service';
 import { tradeEventService } from './trade-event.service';
 import { tradeIntentService } from './trade-intent.service';
@@ -47,17 +52,36 @@ const sameDayIso = (): string => new Date().toISOString().slice(0, 10);
 
 const getIstTime = (): { timeIST: string; minutesToClose: number; minutesSinceOpen: number } => {
   const now = new Date();
-  const ist = now.toLocaleTimeString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    hour12: false,
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  const ist = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit', minute: '2-digit' });
   const [h, m] = ist.split(':').map(Number);
   const minutesToClose = Math.max(0, (15 * 60 + 15) - (h * 60 + m));
   const minutesSinceOpen = (h - 9) * 60 + (m - 15);
   return { timeIST: ist, minutesToClose, minutesSinceOpen };
 };
+
+// ── Signal cooldown: prevents burst entries from the same repeated signal ──
+// Maps underlying symbol → timestamp of last accepted signal
+const lastSignalTime = new Map<string, number>();
+const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes between consecutive signals
+
+function isInCooldown(sym: string): boolean {
+  const last = lastSignalTime.get(sym);
+  if (!last) return false;
+  return Date.now() - last < SIGNAL_COOLDOWN_MS;
+}
+
+function recordSignal(sym: string): void {
+  lastSignalTime.set(sym, Date.now());
+}
+
+// ── PCR from ±10 strikes around ATM ──────────────────────────────────────
+function computePcr(chainRows: { strikePrice: number; callOi: number | null; putOi: number | null }[], atmStrike: number): number {
+  const sorted = [...chainRows].sort((a, b) => Math.abs(a.strikePrice - atmStrike) - Math.abs(b.strikePrice - atmStrike));
+  const nearAtm = sorted.slice(0, 21); // ±10 strikes
+  const totalPutOi = nearAtm.reduce((s, r) => s + (r.putOi ?? 0), 0);
+  const totalCallOi = nearAtm.reduce((s, r) => s + (r.callOi ?? 0), 0);
+  return totalCallOi > 0 ? totalPutOi / totalCallOi : 1;
+}
 
 // ── DB decision logger ────────────────────────────────────────────────────
 
@@ -146,13 +170,10 @@ class StrategyService {
       enabled: this.enabled,
       activeUnderlying: underlyingService.getActive().symbol,
       enabledStrategies: strategyRegistry.getEnabled(),
-      risk,
-      openPositions,
-      pendingIntents,
+      risk, openPositions, pendingIntents,
     };
   }
 
-  // ── Core: evaluate + optionally queue an intent ──────────────────────
   async evaluateAndQueueSignal(createIntent = true): Promise<{
     signal: StrategySignal | null;
     intentId: number | null;
@@ -172,14 +193,27 @@ class StrategyService {
       return { signal: null, intentId: null, logId: null, decisionSource: 'risk-gate', strategyName: null };
     }
 
-    // 2. No pending intents
-    const existingPending = await TradeIntent.count({ where: { source: 'STRATEGY', status: 'PENDING_APPROVAL' } });
+    // 2. Pending-intent / open-position guard
+    const [existingPending, existingOpen] = await Promise.all([
+      TradeIntent.count({ where: { source: 'STRATEGY', status: 'PENDING_APPROVAL' } }),
+      StrategyPosition.count({ where: { status: 'OPEN' } }),
+    ]);
     if (existingPending > 0) {
       await logDecision({ underlying: sym, decision: 'REJECTED', rejectionCategory: 'PENDING_INTENT', rejectionReason: 'Pending approval intent exists', latencyMs: Date.now() - cycleStart });
       return { signal: null, intentId: null, logId: null, decisionSource: 'pending-guard', strategyName: null };
     }
+    if (existingOpen > 0) {
+      await logDecision({ underlying: sym, decision: 'REJECTED', rejectionCategory: 'PENDING_INTENT', rejectionReason: `${existingOpen} open position(s) already active`, latencyMs: Date.now() - cycleStart });
+      return { signal: null, intentId: null, logId: null, decisionSource: 'open-position-guard', strategyName: null };
+    }
 
-    // 3. Time filter
+    // 3. Signal cooldown guard (prevents burst entries every 20s from same setup)
+    if (isInCooldown(sym)) {
+      await logDecision({ underlying: sym, decision: 'REJECTED', rejectionCategory: 'OTHER', rejectionReason: `Signal cooldown active (${SIGNAL_COOLDOWN_MS / 1000}s between signals)`, latencyMs: Date.now() - cycleStart });
+      return { signal: null, intentId: null, logId: null, decisionSource: 'cooldown', strategyName: null };
+    }
+
+    // 4. Time filter
     const { timeIST, minutesToClose, minutesSinceOpen } = getIstTime();
     if (minutesSinceOpen < 15) {
       await logDecision({ underlying: sym, decision: 'REJECTED', rejectionCategory: 'MARKET_HOURS', rejectionReason: `Too early (${timeIST} IST)`, latencyMs: Date.now() - cycleStart });
@@ -190,7 +224,7 @@ class StrategyService {
       return { signal: null, intentId: null, logId: null, decisionSource: 'time-filter', strategyName: null };
     }
 
-    // 4. Build market context
+    // 5. Build market context
     let latestIndexPrice: number | null = null;
     let strategyContext: StrategyContext | null = null;
 
@@ -199,19 +233,22 @@ class StrategyService {
       latestIndexPrice = tick?.ltp ?? null;
 
       if (!latestIndexPrice) {
-        // No live tick yet — try fetching
         const fetched = await marketDataService.fetchAndStoreTick(underlying.instrumentKey, underlying.symbol).catch(() => null);
         latestIndexPrice = fetched?.ltp ?? null;
       }
 
-      const history = await marketDataService.getTickHistory(80, underlying.instrumentKey);
-      if (history.length < 20) {
-        await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'NO_SIGNAL', rejectionReason: `Insufficient history: ${history.length} ticks (need 20)`, latencyMs: Date.now() - cycleStart });
+      // Primary: 5-min candles (session-only)
+      const candles = await marketDataService.getCandleHistory(60, underlying.instrumentKey);
+      // Fallback: session-only ticks
+      const history = await marketDataService.getSessionTickHistory(100, underlying.instrumentKey);
+
+      if (candles.length < 5 && history.length < 20) {
+        await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'NO_SIGNAL', rejectionReason: `Insufficient data: ${candles.length} candles, ${history.length} ticks (need 5 candles or 20 ticks)`, latencyMs: Date.now() - cycleStart });
         return { signal: null, intentId: null, logId: null, decisionSource: 'no-history', strategyName: null };
       }
 
       const prices = history.map((t) => t.ltp);
-      const lastPrice = latestIndexPrice ?? prices[prices.length - 1];
+      const lastPrice = latestIndexPrice ?? (candles.length > 0 ? Number(candles[candles.length - 1].close) : prices[prices.length - 1]);
 
       // Option chain
       const chain = await marketDataService.fetchAndStoreOptionChain(undefined, underlying.symbol).catch(() => null);
@@ -225,23 +262,40 @@ class StrategyService {
         return { signal: null, intentId: null, logId: null, decisionSource: 'expiry-day', strategyName: null };
       }
 
-      const nearAtm = [...chain.rows]
-        .sort((a, b) => Math.abs(a.strikePrice - lastPrice) - Math.abs(b.strikePrice - lastPrice))
-        .slice(0, 5);
-
-      const atmRow = nearAtm[0];
+      // Sort chain rows by distance to ATM
+      const sortedByAtm = [...chain.rows].sort((a, b) => Math.abs(a.strikePrice - lastPrice) - Math.abs(b.strikePrice - lastPrice));
+      const atmRow = sortedByAtm[0];
       if (!atmRow) {
         await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'NO_LIQUID_OPTION', rejectionReason: 'No ATM row found', latencyMs: Date.now() - cycleStart });
         return { signal: null, intentId: null, logId: null, decisionSource: 'no-atm', strategyName: null };
       }
 
-      const totalPutOi = nearAtm.reduce((s, r) => s + (r.putOi ?? 0), 0);
-      const totalCallOi = nearAtm.reduce((s, r) => s + (r.callOi ?? 0), 0);
-      const pcr = totalCallOi > 0 ? totalPutOi / totalCallOi : 1;
+      // PCR from ±10 strikes (fixed from ±2 strikes)
+      const pcr = computePcr(chain.rows, atmRow.strikePrice);
+
+      // Real ATM OI and IV from chain
+      const atmCallOi = atmRow.callOi ?? 0;
+      const atmPutOi = atmRow.putOi ?? 0;
+      const atmIv = atmRow.iv;
+
+      // dayHigh, dayLow, prevDayClose: from latest candle (filled from Upstox OHLC)
+      const latestCandle = candles.length > 0 ? candles[candles.length - 1] : null;
+      const dayHigh = latestCandle?.dayHigh !== null && latestCandle?.dayHigh !== undefined
+        ? Number(latestCandle.dayHigh)
+        : prices.length > 0 ? Math.max(...prices) : lastPrice;
+      const dayLow = latestCandle?.dayLow !== null && latestCandle?.dayLow !== undefined
+        ? Number(latestCandle.dayLow)
+        : prices.length > 0 ? Math.min(...prices) : lastPrice;
+      const prevDayClose = latestCandle?.prevClose !== null && latestCandle?.prevClose !== undefined
+        ? Number(latestCandle.prevClose)
+        : lastPrice; // fallback to current if no candle data yet
+
+      const vix = getLatestVix();
 
       strategyContext = {
         underlying: sym,
         prices,
+        candles,
         lastPrice,
         pcr,
         atmStrike: atmRow.strikePrice,
@@ -253,6 +307,13 @@ class StrategyService {
         timeIST,
         minutesToClose,
         lotSize: underlying.defaultLotSize,
+        atmCallOi,
+        atmPutOi,
+        atmIv: atmIv ?? null,
+        dayHigh,
+        dayLow,
+        prevDayClose,
+        vix,
       };
 
     } catch (buildError) {
@@ -261,7 +322,7 @@ class StrategyService {
       return { signal: null, intentId: null, logId: null, decisionSource: 'build-error', strategyName: null };
     }
 
-    // 5. Run strategy registry
+    // 6. Run strategy registry
     const registryResult = strategyRegistry.runAll(strategyContext);
     if (!registryResult) {
       await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'NO_SIGNAL', rejectionReason: 'No strategy produced a signal', latencyMs: Date.now() - cycleStart });
@@ -270,23 +331,52 @@ class StrategyService {
 
     const { signal, strategyName } = registryResult;
 
-    // 6. Rule-based probability check
+    // 7. Rule-based probability check
     const meta = signal.metadata as Record<string, unknown>;
     const optionType: 'CALL' | 'PUT' = (meta.bullish as boolean) ? 'CALL' : 'PUT';
 
+    const candlePrices = strategyContext.candles.length >= 5
+      ? strategyContext.candles.map((c) => Number(c.close))
+      : strategyContext.prices;
+
+    const atr14 = (meta.atr as number) ?? atr(candlePrices, 14);
+    const stDir = (meta.supertrendDirection as 'BULLISH' | 'BEARISH' | null | undefined) ?? supertrend(candlePrices, 10, 3, sym);
+    const { adx: adx14 } = adx(candlePrices, 14);
+    const bb = bollingerBands(candlePrices, 20, 2);
+    const stoch = stochastic(candlePrices, 14, 3);
+
     const ruleParams: AiDecisionParams = {
-      index: sym, currentPrice: latestIndexPrice ?? 0,
-      atmStrike: (meta.strike as number) ?? 0, optionType, optionPremium: signal.entryPrice,
-      rsi14: (meta.rsi14 as number) ?? 50, ema9: (meta.ema9 as number) ?? 0, ema21: (meta.ema21 as number) ?? 0,
-      macd: (meta.macd as number) ?? 0, macdSignal: (meta.macdSignal as number) ?? 0,
+      index: sym,
+      currentPrice: latestIndexPrice ?? 0,
+      atmStrike: (meta.strike as number) ?? 0,
+      optionType,
+      optionPremium: signal.entryPrice,
+      rsi14: (meta.rsi14 as number) ?? 50,
+      ema9: (meta.ema9 as number) ?? 0,
+      ema21: (meta.ema21 as number) ?? 0,
+      macd: (meta.macd as number) ?? 0,
+      macdSignal: (meta.macdSignal as number) ?? 0,
       macdHistogram: (meta.macdHistogram as number) ?? 0,
-      vwap: (meta.vwap as number) ?? (latestIndexPrice ?? 0), volumeRatio: (meta.volumeRatio as number) ?? 1,
-      dayHigh: (meta.dayHigh as number) ?? (latestIndexPrice ?? 0), dayLow: (meta.dayLow as number) ?? (latestIndexPrice ?? 0),
-      prevDayClose: (meta.prevDayClose as number) ?? (latestIndexPrice ?? 0),
-      atmCallOI: (meta.atmCallOI as number) ?? 0, atmPutOI: (meta.atmPutOI as number) ?? 0,
-      pcrRatio: (meta.pcr as number) ?? 1, ivPercentile: (meta.ivPercentile as number) ?? 40,
-      indiaVix: env.indiaVixOverride || (meta.indiaVix as number) || 14,
-      timeIST, minutesToClose,
+      vwap: (meta.vwap as number) ?? (latestIndexPrice ?? 0),
+      volumeRatio: (meta.volumeRatio as number) ?? 1,
+      dayHigh: strategyContext.dayHigh,
+      dayLow: strategyContext.dayLow,
+      prevDayClose: strategyContext.prevDayClose,
+      // Real OI values from chain
+      atmCallOI: strategyContext.atmCallOi,
+      atmPutOI: strategyContext.atmPutOi,
+      pcrRatio: strategyContext.pcr,
+      ivPercentile: strategyContext.atmIv ?? 40,
+      indiaVix: strategyContext.vix,
+      timeIST,
+      minutesToClose,
+      atr14,
+      adx14,
+      supertrendDirection: stDir,
+      bbPercentB: bb.percentB,
+      bbBandwidth: bb.bandwidth,
+      stochK: stoch.k,
+      stochD: stoch.d,
     };
 
     const ruleResult = computeRuleBasedDecision(ruleParams);
@@ -297,13 +387,13 @@ class StrategyService {
       return { signal, intentId: null, logId: null, decisionSource: 'rules-skip', strategyName };
     }
 
-    // 7. Confidence gate
+    // 8. Confidence gate
     if (signal.confidence < env.strategyConfidenceThreshold) {
       await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'LOW_CONFIDENCE', rejectionReason: `Confidence ${(signal.confidence * 100).toFixed(1)}% < ${(env.strategyConfidenceThreshold * 100).toFixed(1)}%`, confidence: signal.confidence, signalSource: signal.source, rationale: signal.rationale, signalMetadata: signal.metadata, latencyMs: Date.now() - cycleStart });
       return { signal, intentId: null, logId: null, decisionSource: 'confidence-gate', strategyName };
     }
 
-    // 8. AI decision
+    // 9. AI decision
     let aiLatencyMs: number | null = null;
     let finalConfidence = signal.confidence;
     let decisionSource = 'rules-only';
@@ -342,7 +432,7 @@ class StrategyService {
       return { signal, intentId: null, logId: null, decisionSource, strategyName };
     }
 
-    // 9. Create TradeIntent
+    // 10. Create TradeIntent + record cooldown
     const tradeOfDay = risk.tradeCountToday + 1;
     try {
       const intent = await tradeIntentService.createIntent({
@@ -350,7 +440,7 @@ class StrategyService {
         instrumentKey: signal.instrumentKey, quantity: signal.quantity,
         orderType: 'MARKET', product: 'I', validity: 'DAY',
         tag: 'auto-' + Date.now(), confidence: finalConfidence, rationale: signal.rationale,
-        requiresApproval: env.requireTradeApproval, expiresInMinutes: 10,
+        requiresApproval: env.requireTradeApproval, expiresInMinutes: 2,
         metadata: {
           ...signal.metadata, entryPrice: signal.entryPrice,
           stopLossPrice: signal.suggestedStopLoss, targetPrice: signal.suggestedTarget,
@@ -358,6 +448,9 @@ class StrategyService {
           strategyDate: sameDayIso(), decisionSource, strategyName, ruleSignals: ruleResult.signals,
         },
       });
+
+      // Record signal time AFTER successful intent creation
+      recordSignal(sym);
 
       const intentId = Number(intent.id);
       const logEntry = await StrategyDecisionLog.create({
@@ -371,9 +464,7 @@ class StrategyService {
         latencyMs: Date.now() - cycleStart, aiProvider, aiLatencyMs, tradeOfDay,
       });
 
-      // Hand off to execution engine
       await executionService.processNewIntent(intentId, sym);
-
       return { signal, intentId, logId: Number(logEntry.id), decisionSource, strategyName };
 
     } catch (intentError) {
@@ -406,11 +497,11 @@ class StrategyService {
     if (params?.decision) where['decision'] = params.decision;
     if (params?.underlying) where['underlying'] = params.underlying;
     if (params?.since) where['createdAt'] = { [Op.gte]: params.since };
-    return StrategyDecisionLog.findAll({ where, order: [['createdAt', 'DESC']], limit });
+    return StrategyDecisionLog.findAll({ where: where as never, order: [['createdAt', 'DESC']], limit });
   }
 
   async getDecisionLogSummaryToday() {
-    const logs = await StrategyDecisionLog.findAll({ where: { createdAt: { [Op.gte]: startOfDay() } } });
+    const logs = await StrategyDecisionLog.findAll({ where: { createdAt: { [Op.gte]: startOfDay() } } as never });
     let accepted = 0, rejected = 0, failed = 0, totalLatency = 0, latencyCount = 0;
     const breakdown: Record<string, number> = {};
     for (const log of logs) {
@@ -425,6 +516,7 @@ class StrategyService {
   private async runCycle(): Promise<void> {
     await tradeIntentService.expireStaleIntents();
     if (!this.enabled) return;
+    if (!isMarketOpen()) return;
     try {
       const status = await tokenService.getConnectionStatus();
       if (!status.connected) return;
@@ -436,14 +528,23 @@ class StrategyService {
 
   private async getRiskSnapshot(): Promise<StrategyRiskSnapshot> {
     const start = startOfDay();
-    const [tradeCountToday, closedPositions] = await Promise.all([
+    const [tradeCountToday, closedPositions, openPositions] = await Promise.all([
       TradeIntent.count({ where: { source: 'STRATEGY', status: 'EXECUTED', [Op.and]: [sqlWhere(col('created_at'), Op.gte, start)] } }),
       StrategyPosition.findAll({ where: { status: 'CLOSED', [Op.and]: [sqlWhere(col('updated_at'), Op.gte, start)] } }),
+      StrategyPosition.findAll({ where: { status: 'OPEN' } }),
     ]);
-    const dailyPnl = closedPositions.reduce((sum, pos) => sum + (pos.realizedPnl !== null ? Number(pos.realizedPnl) : 0), 0);
+
+    // Realized P&L from positions closed today
+    const realizedPnl = closedPositions.reduce((sum, pos) => sum + (pos.realizedPnl !== null ? Number(pos.realizedPnl) : 0), 0);
+
+    // Unrealized P&L from currently open positions (include so daily cap catches live losses)
+    const unrealizedPnl = openPositions.reduce((sum, pos) => sum + (pos.unrealizedPnl !== null ? Number(pos.unrealizedPnl) : 0), 0);
+
+    const dailyPnl = realizedPnl + unrealizedPnl;
     const dailyLossLimit = -(env.strategyCapital * env.strategyDailyMaxLossPct) / 100;
+
     if (tradeCountToday >= env.strategyMaxAutoTradesPerDay) return { tradeCountToday, dailyPnl, dailyLossLimit, blocked: true, blockReason: `Max trades reached (${env.strategyMaxAutoTradesPerDay}/day).` };
-    if (dailyPnl <= dailyLossLimit) return { tradeCountToday, dailyPnl, dailyLossLimit, blocked: true, blockReason: `Daily loss limit reached.` };
+    if (dailyPnl <= dailyLossLimit) return { tradeCountToday, dailyPnl, dailyLossLimit, blocked: true, blockReason: `Daily loss limit reached (realized + unrealized = ₹${dailyPnl.toFixed(0)}).` };
     return { tradeCountToday, dailyPnl, dailyLossLimit, blocked: false, blockReason: null };
   }
 }

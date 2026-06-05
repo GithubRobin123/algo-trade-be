@@ -1,5 +1,6 @@
 import { NextFunction, Request, Response } from 'express';
 import { ApiError } from '../middleware/error.middleware';
+import { executionService } from '../services/execution.service';
 import { strategyRegistry } from '../services/strategy-registry.service';
 import { strategyService } from '../services/strategy.service';
 import { tradeEventService } from '../services/trade-event.service';
@@ -100,5 +101,47 @@ export const getPositionEvents = async (req: Request, res: Response, next: NextF
 export const getDecisionSummaryToday = async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     res.json({ success: true, data: await strategyService.getDecisionLogSummaryToday() });
+  } catch (error) { next(error); }
+};
+
+// ── EMERGENCY EXIT ─────────────────────────────────────────────────────────
+/**
+ * POST /api/strategy/emergency-exit
+ *
+ * PANIC BUTTON — closes ALL open positions immediately, cancels all pending
+ * broker orders, rejects all pending intents, and disables the strategy engine.
+ * Bypasses every gate, cooldown, and approval workflow.
+ *
+ * This MUST work even if the strategy service is in a broken state.
+ * It runs independently of the strategy loop.
+ */
+export const emergencyExitAll = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const triggeredBy = typeof req.body?.triggeredBy === 'string'
+      ? req.body.triggeredBy
+      : req.ip ?? 'unknown';
+
+    // Step 1: Immediately disable the strategy engine (no new trades)
+    strategyService.setEnabled(false);
+
+    // Step 2: Force-close everything
+    const result = await executionService.emergencyExitAll(triggeredBy);
+
+    res.json({
+      success: true,
+      message: `Emergency exit complete. ${result.closedCount} position(s) closed, ${result.failedCount} failed.`,
+      data: result,
+    });
+  } catch (error) { next(error); }
+};
+
+// ── PnL ticks for position chart ───────────────────────────────────────────
+export const getPositionPnlTicks = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const positionId = Number(req.params.positionId);
+    if (Number.isNaN(positionId)) throw new ApiError(400, 'Invalid positionId.');
+    const limit = Number(req.query.limit ?? 200);
+    const ticks = await strategyService.getPositionPnlTicks(positionId, limit);
+    res.json({ success: true, data: ticks });
   } catch (error) { next(error); }
 };

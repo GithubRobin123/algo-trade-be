@@ -119,8 +119,8 @@ export class DashboardService {
     const positions = await StrategyPosition.findAll({
       where: {
         status: 'CLOSED',
-        updatedAt: { [Op.gte]: since },
-      },
+        updated_at: { [Op.gte]: since },
+      } as never,
       order: [['updatedAt', 'ASC']],
     });
 
@@ -174,9 +174,9 @@ export class DashboardService {
 
   private async getTodayDecisionSummary(since: Date) {
     const [decisions, orders, closedPositions, openPositions] = await Promise.all([
-      StrategyDecisionLog.findAll({ where: { createdAt: { [Op.gte]: since } } }),
-      TradeOrder.findAll({ where: { createdAt: { [Op.gte]: since } } }),
-      StrategyPosition.findAll({ where: { status: 'CLOSED', updatedAt: { [Op.gte]: since } } }),
+      StrategyDecisionLog.findAll({ where: { created_at: { [Op.gte]: since } } as never }),
+      TradeOrder.findAll({ where: { created_at: { [Op.gte]: since } } as never }),
+      StrategyPosition.findAll({ where: { status: 'CLOSED', updated_at: { [Op.gte]: since } } as never }),
       StrategyPosition.findAll({ where: { status: 'OPEN' } }),
     ]);
 

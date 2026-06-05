@@ -218,18 +218,49 @@ export class UpstoxService {
     }
   }
 
+  async getAvailableExpiries(accessToken: string, instrumentKey: string): Promise<string[]> {
+    try {
+      const { data } = await this.client.get<Record<string, unknown>>('/v2/option/contract', {
+        headers: this.authHeaders(accessToken, API_VERSION_V2),
+        params: { instrument_key: instrumentKey },
+      });
+
+      const contracts = Array.isArray(data.data) ? (data.data as Record<string, unknown>[]) : [];
+      const expiries = [...new Set(contracts.map((c) => c.expiry as string))]
+        .filter(Boolean)
+        .sort();
+
+      return expiries;
+    } catch {
+      return [];
+    }
+  }
+
+  async getNearestExpiry(accessToken: string, instrumentKey: string): Promise<string | null> {
+    const expiries = await this.getAvailableExpiries(accessToken, instrumentKey);
+    const today = new Date().toISOString().slice(0, 10);
+    return expiries.find((e) => e >= today) ?? expiries[0] ?? null;
+  }
+
   async getOptionChain(
     accessToken: string,
     instrumentKey: string,
     expiryDate?: string,
   ): Promise<Record<string, unknown>> {
+    // If no expiry date provided, auto-resolve the nearest valid one from Upstox
+    let resolvedExpiry = expiryDate;
+    if (!resolvedExpiry) {
+      resolvedExpiry = (await this.getNearestExpiry(accessToken, instrumentKey)) ?? undefined;
+    }
+
+    if (!resolvedExpiry) {
+      throw new ApiError(400, 'No valid expiry date available for this instrument.');
+    }
+
     try {
       const { data } = await this.client.get<Record<string, unknown>>('/v2/option/chain', {
         headers: this.authHeaders(accessToken, API_VERSION_V2),
-        params: {
-          instrument_key: instrumentKey,
-          ...(expiryDate ? { expiry_date: expiryDate } : {}),
-        },
+        params: { instrument_key: instrumentKey, expiry_date: resolvedExpiry },
       });
 
       return data;
@@ -392,20 +423,44 @@ export class UpstoxService {
     payload: PlaceOrderPayload,
   ): Promise<Record<string, unknown>> {
     try {
-      console.log('Placing order with payload:', payload);
-      // const { data } = await this.client.post<Record<string, unknown>>('/v2/order/place', payload, {
-      //   headers: {
-      //     ...this.authHeaders(accessToken, API_VERSION_V2),
-      //     'Content-Type': 'application/json',
-      //   },
-      // });
+      const { data } = await this.client.post<Record<string, unknown>>('/v2/order/place', payload, {
+        headers: {
+          ...this.authHeaders(accessToken, API_VERSION_V2),
+          'Content-Type': 'application/json',
+        },
+      });
 
-      // return data;
-      return {};
-
+      return data as Record<string, unknown>;
     } catch (error) {
       throw this.toApiError(error, 'Failed to place order on Upstox');
     }
+  }
+
+  /**
+   * Emergency exit: cancel all open orders, then place SELL/BUY-back market orders
+   * for every open position. Bypasses all strategy logic.
+   * Used by emergency exit endpoint and EOD safety sweep.
+   */
+  async cancelAllOrders(accessToken: string): Promise<void> {
+    try {
+      const { data } = await this.client.get<Record<string, unknown>>('/v2/order/retrieve-all', {
+        headers: this.authHeaders(accessToken, API_VERSION_V2),
+      });
+      const root = asRecord(data.data ?? data);
+      const orders = Array.isArray(root) ? root : (root.orders as unknown[] | undefined) ?? [];
+      for (const o of orders) {
+        const order = asRecord(o);
+        const status = toText(order.status);
+        const orderId = toText(order.order_id ?? order.orderId);
+        if (orderId && status && ['open', 'pending', 'trigger pending'].includes(status.toLowerCase())) {
+          try {
+            await this.client.delete(`/v2/order/cancel?order_id=${orderId}`, {
+              headers: this.authHeaders(accessToken, API_VERSION_V2),
+            });
+          } catch { /* ignore individual cancel failures */ }
+        }
+      }
+    } catch { /* ignore — best-effort */ }
   }
 
   private normalizeHolding(input: unknown): UpstoxHoldingRecord | null {

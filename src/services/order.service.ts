@@ -37,19 +37,21 @@ class OrderService {
       ...(input.tag ? { tag: input.tag } : {}),
     };
 
-    const orderCheck = await accountService.checkOrder(side, {
-      instrumentKey: input.instrumentKey,
-      quantity: input.quantity,
-      price: input.price,
-      orderType: input.orderType,
-      product: input.product,
-    });
-
-    if (!orderCheck.allowed) {
-      throw new ApiError(400, orderCheck.reason ?? 'Order blocked by wallet/holding validation.');
-    }
-
+    // Paper trading mode: skip wallet/margin check entirely.
+    // All trades are simulated for P&L tracking without any real execution.
     if (!env.enableLiveOrders) {
+      // For MARKET orders with no price, fetch current LTP so P&L can be tracked
+      let paperPrice = input.price ?? null;
+      if (paperPrice == null && (input.orderType ?? 'MARKET') === 'MARKET') {
+        try {
+          const accessToken = await tokenService.getValidAccessToken().catch(() => null);
+          if (accessToken) {
+            const quote = await upstoxService.getNiftyLtp(accessToken, input.instrumentKey);
+            paperPrice = quote.ltp;
+          }
+        } catch { /* ignore — price stays null */ }
+      }
+
       return TradeOrder.create({
         provider: 'upstox',
         providerOrderId: `paper-${randomUUID()}`,
@@ -60,17 +62,27 @@ class OrderService {
         product: payload.product,
         orderType: payload.order_type,
         validity: payload.validity,
-        price: input.price ?? null,
+        price: paperPrice,
         triggerPrice: input.triggerPrice ?? null,
         status: 'SIMULATED',
         isPaper: true,
         requestPayload: payload,
-        responsePayload: {
-          message: 'Paper trading mode active. Set ENABLE_LIVE_ORDERS=true to place real orders on Upstox.',
-          orderCheck,
-        },
+        responsePayload: { message: 'Paper trading — no real order sent to Upstox.', entryPrice: paperPrice },
         errorMessage: null,
       });
+    }
+
+    // Live orders only: enforce wallet/margin check before sending to Upstox
+    const orderCheck = await accountService.checkOrder(side, {
+      instrumentKey: input.instrumentKey,
+      quantity: input.quantity,
+      price: input.price,
+      orderType: input.orderType,
+      product: input.product,
+    });
+
+    if (!orderCheck.allowed) {
+      throw new ApiError(400, orderCheck.reason ?? 'Order blocked by wallet/holding validation.');
     }
 
     const accessToken = await tokenService.getValidAccessToken();

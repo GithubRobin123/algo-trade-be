@@ -132,9 +132,8 @@ class TradeIntentService {
       intent.executedOrderId = Number(order.id);
       await intent.save();
 
-      if (intent.source === 'STRATEGY') {
-        await this.createStrategyPosition(intent, order);
-      }
+      // Create a position for ALL intents (STRATEGY + MANUAL) so P&L is always tracked
+      await this.createStrategyPosition(intent, order);
 
       return {
         intent,
