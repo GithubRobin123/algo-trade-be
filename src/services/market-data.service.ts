@@ -229,7 +229,9 @@ class MarketDataService {
     }
 
     const accessToken = await tokenService.getValidAccessToken();
-    const resolvedExpiryDate = expiryDate || env.optionChainExpiryDate || undefined;
+    const today = new Date().toISOString().slice(0, 10);
+    const configuredExpiry = env.optionChainExpiryDate;
+    const resolvedExpiryDate = expiryDate || (configuredExpiry && configuredExpiry >= today ? configuredExpiry : undefined);
     const raw = await upstoxService.getOptionChain(accessToken, underlying.optionChainInstrumentKey, resolvedExpiryDate);
     const normalized = this.normalizeOptionChain(raw, resolvedExpiryDate, underlying.symbol, underlying.optionChainInstrumentKey);
 
@@ -275,9 +277,11 @@ class MarketDataService {
 
   async getLatestOptionChain(expiryDate?: string, symbolOrInstrument?: string): Promise<NormalizedOptionChain | null> {
     const underlying = underlyingService.resolve(symbolOrInstrument);
+    const today = new Date().toISOString().slice(0, 10);
     const where: WhereOptions = {
       instrumentKey: underlying.optionChainInstrumentKey,
-      ...(expiryDate ? { expiryDate } : {}),
+      // Only return snapshots whose expiry is today or in the future — never stale past-expiry data
+      ...(expiryDate ? { expiryDate } : { expiryDate: { [Op.gte]: today } }),
     };
     const snapshot = await OptionChainSnapshot.findOne({ where, order: [['snapshotTime', 'DESC']] });
     if (!snapshot) return null;
@@ -398,7 +402,9 @@ class MarketDataService {
       // Aggregate candles every 5 polls (~25 seconds) to keep overhead low
       this.pollCount++;
       if (this.pollCount % 5 === 0) {
-        void candleAggregator.aggregatePendingWindows();
+        candleAggregator.aggregatePendingWindows().catch((err: unknown) => {
+          process.stderr.write('[CandleAgg] ' + String(err) + '\n');
+        });
       }
     } catch (error) {
       this.handlePollError(error);

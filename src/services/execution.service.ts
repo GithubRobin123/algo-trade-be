@@ -52,9 +52,14 @@ function isEodSquareOffTime(): boolean {
 
 // ── Service ────────────────────────────────────────────────────────────────
 
+// Skip an instrument in the monitor after this many consecutive failures
+const MONITOR_FAILURE_LIMIT = 5;
+
 class ExecutionService {
   private monitorTimer: NodeJS.Timeout | null = null;
   private eodSquaredOff = false;
+  // Tracks consecutive monitor failures per instrumentKey to prevent Upstox rate limiting
+  private monitorFailures = new Map<string, number>();
 
   /**
    * Start the execution engine.
@@ -310,11 +315,25 @@ class ExecutionService {
     }
 
     for (const position of openPositions) {
+      const failures = this.monitorFailures.get(position.instrumentKey) ?? 0;
+      if (failures >= MONITOR_FAILURE_LIMIT) {
+        // Already failing repeatedly — skip to avoid Upstox rate limiting.
+        // Will auto-resume if position is closed or manually reset.
+        continue;
+      }
+
       try {
         await this.monitorSinglePosition(position, accessToken);
+        // Clear failure count on success
+        this.monitorFailures.delete(position.instrumentKey);
       } catch (err) {
+        const newCount = failures + 1;
+        this.monitorFailures.set(position.instrumentKey, newCount);
         process.stderr.write(
-          '[Monitor] ' + position.instrumentKey + ': ' + String(err) + '\n',
+          '[Monitor] ' + position.instrumentKey + ': ' + String(err) +
+          (newCount >= MONITOR_FAILURE_LIMIT
+            ? ' — skipping this instrument (too many failures)\n'
+            : ' (failure ' + newCount + '/' + MONITOR_FAILURE_LIMIT + ')\n'),
         );
       }
     }
