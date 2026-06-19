@@ -64,6 +64,9 @@ class MarketDataService {
   private pollTimer: NodeJS.Timeout | null = null;
   private hasLoggedAuthWarning = false;
   private pollCount = 0;
+  // In-memory cache for option chain API responses — skips redundant HTTP calls within the snapshot gap
+  private lastChainFetchAt = new Map<string, number>();
+  private lastChainData = new Map<string, NormalizedOptionChain>();
 
   startPolling(): void {
     if (this.pollTimer) return;
@@ -82,6 +85,40 @@ class MarketDataService {
   }> {
     const active = underlyingService.getActive();
     return this.fetchAndStoreTick(active.instrumentKey, active.symbol);
+  }
+
+  /**
+   * Ingest a tick from any source — HTTP poll today, Upstox WebSocket tomorrow.
+   * To switch to WebSocket: call this directly from the WS message handler instead
+   * of pollOnce. No other changes needed in the rest of the system.
+   */
+  async ingestTick(
+    instrumentKey: string,
+    ltp: number,
+    symbol: string,
+    sourceTimestamp: string,
+    richPayload: Record<string, unknown> = {},
+  ): Promise<{ symbol: string; instrumentKey: string; ltp: number; sourceTimestamp: string }> {
+    const tick = await MarketTick.create({
+      symbol,
+      instrumentKey,
+      ltp,
+      sourceTimestamp: new Date(sourceTimestamp),
+      rawPayload: richPayload,
+    });
+
+    const payload = {
+      id: Number(tick.id),
+      symbol: tick.symbol,
+      instrumentKey: tick.instrumentKey,
+      ltp: Number(tick.ltp),
+      sourceTimestamp: tick.sourceTimestamp.toISOString(),
+      createdAt: tick.createdAt?.toISOString() ?? new Date().toISOString(),
+    };
+
+    websocketService.broadcast('tick', payload);
+    this.hasLoggedAuthWarning = false;
+    return { symbol: payload.symbol, instrumentKey: payload.instrumentKey, ltp: payload.ltp, sourceTimestamp: payload.sourceTimestamp };
   }
 
   /**
@@ -137,27 +174,7 @@ class MarketDataService {
       timestamp = quote.timestamp;
     }
 
-    const tick = await MarketTick.create({
-      symbol,
-      instrumentKey,
-      ltp,
-      sourceTimestamp: new Date(timestamp),
-      rawPayload: richPayload,
-    });
-
-    const payload = {
-      id: Number(tick.id),
-      symbol: tick.symbol,
-      instrumentKey: tick.instrumentKey,
-      ltp: Number(tick.ltp),
-      sourceTimestamp: tick.sourceTimestamp.toISOString(),
-      createdAt: tick.createdAt?.toISOString() ?? new Date().toISOString(),
-    };
-
-    websocketService.broadcast('tick', payload);
-    this.hasLoggedAuthWarning = false;
-
-    return { symbol: payload.symbol, instrumentKey: payload.instrumentKey, ltp: payload.ltp, sourceTimestamp: payload.sourceTimestamp };
+    return this.ingestTick(instrumentKey, ltp, symbol, timestamp, richPayload);
   }
 
   /** Latest tick for a given instrument (no date filter — for live display). */
@@ -228,12 +245,25 @@ class MarketDataService {
       throw new ApiError(400, `${underlying.symbol} does not support option chain in current config.`);
     }
 
-    const accessToken = await tokenService.getValidAccessToken();
     const today = new Date().toISOString().slice(0, 10);
     const configuredExpiry = env.optionChainExpiryDate;
     const resolvedExpiryDate = expiryDate || (configuredExpiry && configuredExpiry >= today ? configuredExpiry : undefined);
+    const cacheKey = `${underlying.optionChainInstrumentKey}:${resolvedExpiryDate ?? 'default'}`;
+
+    // Skip the Upstox API call if we fetched within the snapshot gap.
+    // The spot price is polled separately every 5s, so strategy logic always has a fresh underlying price.
+    const lastFetch = this.lastChainFetchAt.get(cacheKey) ?? 0;
+    if (Date.now() - lastFetch < MIN_CHAIN_SNAPSHOT_GAP_MS) {
+      const cached = this.lastChainData.get(cacheKey);
+      if (cached) return cached;
+    }
+
+    const accessToken = await tokenService.getValidAccessToken();
     const raw = await upstoxService.getOptionChain(accessToken, underlying.optionChainInstrumentKey, resolvedExpiryDate);
     const normalized = this.normalizeOptionChain(raw, resolvedExpiryDate, underlying.symbol, underlying.optionChainInstrumentKey);
+
+    this.lastChainFetchAt.set(cacheKey, Date.now());
+    this.lastChainData.set(cacheKey, normalized);
 
     await this.insertOptionChainSnapshot(normalized);
     websocketService.broadcast('option_chain', normalized);

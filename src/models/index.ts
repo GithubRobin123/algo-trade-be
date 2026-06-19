@@ -6,7 +6,7 @@ import { initOptionChainSnapshotModel } from './option-chain-snapshot.model';
 import { initPositionPnlTickModel } from './position-pnl-tick.model';
 import { initStrategyDecisionLogModel } from './strategy-decision-log.model';
 import { initStrategyPositionModel } from './strategy-position.model';
-import { initTradeEventLogModel } from '../services/trade-event.service';
+import { initTradeEventLogModel } from './trade-event-log.model';
 import { initStockInstrumentModel } from './stock-instrument.model';
 import { initTradeIntentModel } from './trade-intent.model';
 import { initTradeOrderModel } from './trade-order.model';

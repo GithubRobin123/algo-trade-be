@@ -33,7 +33,6 @@ export const initOAuthTokenModel = (sequelize: Sequelize): void => {
       provider: {
         type: DataTypes.STRING,
         allowNull: false,
-        unique: true,
       },
       accessToken: {
         type: DataTypes.TEXT,
@@ -65,6 +64,9 @@ export const initOAuthTokenModel = (sequelize: Sequelize): void => {
       tableName: 'oauth_tokens',
       modelName: 'OAuthToken',
       underscored: true,
+      indexes: [
+        { fields: ['provider'], unique: true, name: 'oauth_tokens_provider_key' },
+      ],
     },
   );
 };

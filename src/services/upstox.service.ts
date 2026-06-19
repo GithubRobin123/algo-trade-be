@@ -45,6 +45,10 @@ const toText = (value: unknown): string | null => {
 
 export class UpstoxService {
   private readonly client: AxiosInstance;
+  // Short-lived LTP cache — prevents duplicate API calls when multiple consumers
+  // (position monitor fallback, strategy scan) fire within the same poll window.
+  private readonly ltpCache = new Map<string, { result: UpstoxLtpResult; expiresAt: number }>();
+  private static readonly LTP_CACHE_TTL_MS = 4_000;
 
   constructor() {
     this.client = axios.create({
@@ -127,6 +131,9 @@ export class UpstoxService {
   }
 
   async getNiftyLtp(accessToken: string, instrumentKey: string): Promise<UpstoxLtpResult> {
+    const cached = this.ltpCache.get(instrumentKey);
+    if (cached && Date.now() < cached.expiresAt) return cached.result;
+
     try {
       const { data } = await this.client.get<Record<string, unknown>>('/v2/market-quote/ltp', {
         headers: this.authHeaders(accessToken, API_VERSION_V2),
@@ -165,13 +172,9 @@ export class UpstoxService {
         (quote.trading_symbol as string | undefined) ||
         instrumentKey;
 
-      return {
-        instrumentKey,
-        symbol,
-        ltp,
-        timestamp,
-        raw: quote,
-      };
+      const result: UpstoxLtpResult = { instrumentKey, symbol, ltp, timestamp, raw: quote };
+      this.ltpCache.set(instrumentKey, { result, expiresAt: Date.now() + UpstoxService.LTP_CACHE_TTL_MS });
+      return result;
     } catch (error) {
       if (error instanceof ApiError) {
         throw error;

@@ -37,7 +37,6 @@ export const initWatchlistItemModel = (sequelize: Sequelize): void => {
       instrumentKey: {
         type: DataTypes.STRING,
         allowNull: false,
-        unique: true,
         field: 'instrument_key',
       },
       displayName: {

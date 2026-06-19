@@ -57,9 +57,20 @@ const MONITOR_FAILURE_LIMIT = 5;
 
 class ExecutionService {
   private monitorTimer: NodeJS.Timeout | null = null;
-  private eodSquaredOff = false;
+  // Tracks the IST date (YYYY-MM-DD) when EOD square-off last ran.
+  // Using a date string instead of a boolean means the flag auto-resets every new trading day
+  // without requiring a server restart — fixes the bug where positions stayed OPEN overnight.
+  private eodSquareOffDate: string | null = null;
   // Tracks consecutive monitor failures per instrumentKey to prevent Upstox rate limiting
   private monitorFailures = new Map<string, number>();
+
+  private getIstDateString(): string {
+    return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  }
+
+  private hasEodRunToday(): boolean {
+    return this.eodSquareOffDate === this.getIstDateString();
+  }
 
   /**
    * Start the execution engine.
@@ -84,7 +95,7 @@ class ExecutionService {
   }
 
   resetEodFlag(): void {
-    this.eodSquaredOff = false;
+    this.eodSquareOffDate = null;
   }
 
   /**
@@ -241,7 +252,7 @@ class ExecutionService {
   private async runMonitorCycle(): Promise<void> {
     try {
       // 1. EOD square-off check
-      if (isEodSquareOffTime() && !this.eodSquaredOff) {
+      if (isEodSquareOffTime() && !this.hasEodRunToday()) {
         await this.runEodSquareOff();
         return; // No point checking SL/target after EOD
       }
@@ -259,7 +270,8 @@ class ExecutionService {
 
   // ── EOD square-off ────────────────────────────────────────────────────
   private async runEodSquareOff(): Promise<void> {
-    this.eodSquaredOff = true;
+    // Record the IST date so this only runs once per trading day even across midnight
+    this.eodSquareOffDate = this.getIstDateString();
 
     const openPositions = await StrategyPosition.findAll({
       where: { status: 'OPEN' },
@@ -286,6 +298,37 @@ class ExecutionService {
         closedCount++;
       } catch (err) {
         process.stderr.write('[EOD] Failed to close position ' + pos.id + ': ' + String(err) + '\n');
+
+        // If the broker/order call failed, force-close the DB record anyway so the position
+        // doesn't stay stuck as OPEN overnight (same pattern as emergency exit).
+        try {
+          const lastPrice = pos.currentPrice !== null ? Number(pos.currentPrice) : Number(pos.entryPrice);
+          const realizedPnl = pos.side === 'BUY'
+            ? (lastPrice - Number(pos.entryPrice)) * pos.quantity
+            : (Number(pos.entryPrice) - lastPrice) * pos.quantity;
+          pos.status = 'CLOSED';
+          pos.exitReason = 'EOD_SQUAREOFF_FORCED';
+          pos.realizedPnl = realizedPnl;
+          pos.unrealizedPnl = 0;
+          await pos.save();
+          websocketService.broadcast('position_update', {
+            id: Number(pos.id),
+            symbol: pos.symbol,
+            instrumentKey: pos.instrumentKey,
+            side: pos.side,
+            quantity: pos.quantity,
+            entryPrice: Number(pos.entryPrice),
+            currentPrice: lastPrice,
+            unrealizedPnl: 0,
+            unrealizedPnlPct: 0,
+            stopLossPrice: Number(pos.stopLossPrice),
+            targetPrice: Number(pos.targetPrice),
+            trailActive: pos.trailActive,
+            bestPrice: Number(pos.bestPrice),
+            status: 'CLOSED',
+          });
+          closedCount++;
+        } catch { /* DB also failed — nothing we can do */ }
       }
     }
 
@@ -314,6 +357,21 @@ class ExecutionService {
       return; // No token — skip this cycle
     }
 
+    // Batch-fetch LTPs for all active positions in one API call (N→1 per cycle).
+    // Falls back gracefully: if batch fails, each position falls back to getNiftyLtp().
+    const activeKeys = openPositions
+      .filter((p) => (this.monitorFailures.get(p.instrumentKey) ?? 0) < MONITOR_FAILURE_LIMIT)
+      .map((p) => p.instrumentKey);
+
+    let batchQuotes: Record<string, { ltp: number | null; close: number | null; raw: Record<string, unknown> }> = {};
+    if (activeKeys.length) {
+      try {
+        batchQuotes = await upstoxService.getFullMarketQuote(accessToken, activeKeys);
+      } catch {
+        // Batch failed — each position falls back to individual getNiftyLtp()
+      }
+    }
+
     for (const position of openPositions) {
       const failures = this.monitorFailures.get(position.instrumentKey) ?? 0;
       if (failures >= MONITOR_FAILURE_LIMIT) {
@@ -323,7 +381,8 @@ class ExecutionService {
       }
 
       try {
-        await this.monitorSinglePosition(position, accessToken);
+        const prefetchedLtp = batchQuotes[position.instrumentKey]?.ltp ?? undefined;
+        await this.monitorSinglePosition(position, accessToken, prefetchedLtp);
         // Clear failure count on success
         this.monitorFailures.delete(position.instrumentKey);
       } catch (err) {
@@ -342,9 +401,11 @@ class ExecutionService {
   private async monitorSinglePosition(
     position: StrategyPosition,
     accessToken: string,
+    prefetchedLtp?: number | null,
   ): Promise<void> {
-    const quote = await upstoxService.getNiftyLtp(accessToken, position.instrumentKey);
-    const ltp = quote.ltp;
+    const ltp = prefetchedLtp != null
+      ? prefetchedLtp
+      : (await upstoxService.getNiftyLtp(accessToken, position.instrumentKey)).ltp;
     const entryPrice = Number(position.entryPrice);
     const underlying = position.symbol.split('-')[0] ?? position.symbol;
 
@@ -666,7 +727,7 @@ class ExecutionService {
   // ── Execute approved-but-pending intents ──────────────────────────────
   private async executeApprovedIntents(): Promise<void> {
     const approved = await TradeIntent.findAll({
-      where: { status: 'APPROVED' },
+      where: { status: 'APPROVED', requiresApproval: true },
       limit: 10,
       order: [['createdAt', 'ASC']],
     });

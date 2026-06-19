@@ -219,8 +219,8 @@ class StrategyService {
       await logDecision({ underlying: sym, decision: 'REJECTED', rejectionCategory: 'MARKET_HOURS', rejectionReason: `Too early (${timeIST} IST)`, latencyMs: Date.now() - cycleStart });
       return { signal: null, intentId: null, logId: null, decisionSource: 'time-filter', strategyName: null };
     }
-    if (minutesToClose < 30) {
-      await logDecision({ underlying: sym, decision: 'REJECTED', rejectionCategory: 'MARKET_HOURS', rejectionReason: `Too close to close (${minutesToClose} min)`, latencyMs: Date.now() - cycleStart });
+    if (minutesToClose < 40) {
+      await logDecision({ underlying: sym, decision: 'REJECTED', rejectionCategory: 'MARKET_HOURS', rejectionReason: `Too close to close (${minutesToClose} min, need 40)`, latencyMs: Date.now() - cycleStart });
       return { signal: null, intentId: null, logId: null, decisionSource: 'time-filter', strategyName: null };
     }
 
@@ -529,7 +529,8 @@ class StrategyService {
   private async getRiskSnapshot(): Promise<StrategyRiskSnapshot> {
     const start = startOfDay();
     const [tradeCountToday, closedPositions, openPositions] = await Promise.all([
-      TradeIntent.count({ where: { source: 'STRATEGY', status: 'EXECUTED', [Op.and]: [sqlWhere(col('created_at'), Op.gte, start)] } }),
+      // Count only entry intents (auto-*), not exits (exit-*), so max-trades cap reflects real entries
+      TradeIntent.count({ where: { source: 'STRATEGY', status: 'EXECUTED', tag: { [Op.like]: 'auto-%' }, [Op.and]: [sqlWhere(col('created_at'), Op.gte, start)] } }),
       StrategyPosition.findAll({ where: { status: 'CLOSED', [Op.and]: [sqlWhere(col('updated_at'), Op.gte, start)] } }),
       StrategyPosition.findAll({ where: { status: 'OPEN' } }),
     ]);

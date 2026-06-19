@@ -493,6 +493,10 @@ const bollingerBreakoutStrategy: StrategyPlugin = {
     let signalType = '';
 
     if (bb.percentB <= 0.05 && rsi14 < 38 && ema9Val >= ema21Val * 0.998) {
+      // In a clear downtrend (EMA9 < EMA21) with wide/expanding bands, a lower-bounce CALL has
+      // negative edge — only allow if it's a tight squeeze (bandwidth < 0.20%) where mean
+      // reversion is structurally favoured (as confirmed by June 5 vs June 10 data).
+      if (ema9Val < ema21Val && bb.bandwidth > 0.20) return null;
       bullish = true; signalType = 'BB_LOWER_BOUNCE';
     } else if (bb.percentB >= 0.95 && rsi14 > 62 && ema9Val <= ema21Val * 1.002) {
       bullish = false; signalType = 'BB_UPPER_REVERSAL';
@@ -561,8 +565,9 @@ const stochasticMomentumStrategy: StrategyPlugin = {
     const curr = stochastic(prices, 14, 3);
     const prev = stochastic(prices.slice(0, -1), 14, 3);
 
-    const bullishCross = prev.k < prev.d && curr.k > curr.d && curr.k < 30 && curr.d < 30;
-    const bearishCross = prev.k > prev.d && curr.k < curr.d && curr.k > 70 && curr.d > 70;
+    // Require %K >= 5 (bullish) / <= 95 (bearish) — a cross at single-digit values is noise
+    const bullishCross = prev.k < prev.d && curr.k > curr.d && curr.k < 30 && curr.d < 30 && curr.k >= 5;
+    const bearishCross = prev.k > prev.d && curr.k < curr.d && curr.k > 70 && curr.d > 70 && curr.k <= 95;
     if (!bullishCross && !bearishCross) return null;
 
     const { macdLine, signalLine, histogram } = macd(prices);

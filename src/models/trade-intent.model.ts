@@ -159,6 +159,7 @@ export const initTradeIntentModel = (sequelize: Sequelize): void => {
       indexes: [
         { fields: ['status'] },
         { fields: ['source', 'created_at'] },
+        { fields: ['expires_at'] },
       ],
     },
   );

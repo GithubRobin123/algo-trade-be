@@ -172,7 +172,7 @@ class TradeIntentService {
       },
       {
         where: {
-          status: 'PENDING_APPROVAL',
+          status: { [Op.in]: ['PENDING_APPROVAL', 'APPROVED'] },
           expiresAt: {
             [Op.lt]: new Date(),
           },
@@ -189,6 +189,17 @@ class TradeIntentService {
     if (metadata.isExitIntent === true) {
       return;
     }
+
+    const existingOpen = await StrategyPosition.count({
+      where: { status: 'OPEN', symbol: intent.symbol },
+    });
+    if (existingOpen > 0) {
+      process.stderr.write(
+        `[TradeIntent] Skipping duplicate position for ${intent.symbol} — open position already exists\n`,
+      );
+      return;
+    }
+
     const entryPrice =
       order.price !== null
         ? Number(order.price)

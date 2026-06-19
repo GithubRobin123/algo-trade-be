@@ -10,6 +10,7 @@ import orderRoutes from './order.routes';
 import reportRoutes from './report.routes';
 import stockRoutes from './stock.routes';
 import strategyRoutes from './strategy.routes';
+import tradeHistoryRoutes from './trade-history.routes';
 
 const router = Router();
 
@@ -24,5 +25,6 @@ router.use('/account', accountRoutes);
 router.use('/stocks', stockRoutes);
 router.use('/reports', reportRoutes);
 router.use('/dashboard', dashboardRoutes);
+router.use('/trades', tradeHistoryRoutes);
 
 export default router;
