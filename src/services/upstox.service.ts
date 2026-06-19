@@ -143,6 +143,7 @@ export class UpstoxService {
       });
 
       const root = (data?.data as Record<string, unknown>) ?? data;
+      const rootKeys = Object.keys(root ?? {});
       const quote =
         (root?.[instrumentKey] as Record<string, unknown> | undefined) ??
         (Object.values(root ?? {}).find((value) => typeof value === 'object') as
@@ -150,7 +151,8 @@ export class UpstoxService {
           | undefined);
 
       if (!quote) {
-        throw new ApiError(502, 'Unexpected Upstox quote response shape');
+        process.stderr.write(`[UpstoxLTP] No quote for ${instrumentKey}. Root keys: ${rootKeys.join(', ')}\n`);
+        throw new ApiError(500, `No quote data for ${instrumentKey}. Available keys: ${rootKeys.join(', ')}`);
       }
 
       const ltp =
@@ -159,7 +161,7 @@ export class UpstoxService {
         toNumber((quote.ohlc as Record<string, unknown> | undefined)?.close);
 
       if (ltp === null) {
-        throw new ApiError(502, 'Could not parse LTP from Upstox quote response');
+        throw new ApiError(500, 'Could not parse LTP from Upstox quote response');
       }
 
       const timestamp =
