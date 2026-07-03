@@ -1,17 +1,16 @@
 ﻿import http from 'http';
 import app from './app';
-import { connectDatabase, sequelize } from './config/database';
+import { connectDatabase, dbManager } from './config/database';
 import { env } from './config/env';
-import { initModels } from './models';
 import { marketDataService } from './services/market-data.service';
 import { stockCatalogService } from './services/stock-catalog.service';
 import { strategyService } from './services/strategy.service';
 import { websocketService } from './services/websocket.service';
 
 const bootstrap = async (): Promise<void> => {
-  initModels();
-  await connectDatabase();
-  await sequelize.sync(); // creates new tables (candles); leaves existing tables untouched
+  await connectDatabase(); // also initializes models against whichever DB is active
+  await dbManager.sync(); // creates new tables (candles); leaves existing tables untouched
+  dbManager.startHealthMonitor();
   await stockCatalogService.ensureSeeded();
 
   const server = http.createServer(app);
@@ -29,7 +28,7 @@ const bootstrap = async (): Promise<void> => {
     marketDataService.stopPolling();
     strategyService.stop();
     websocketService.close();
-    await sequelize.close();
+    await dbManager.close();
     server.close(() => {
       process.exit(0);
     });

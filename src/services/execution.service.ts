@@ -548,22 +548,28 @@ class ExecutionService {
   // ── Technical reversal detector ───────────────────────────────────────
   /**
    * Checks whether the underlying's trend has reversed against the open position.
-   * Only triggers when the position has some profit locked in (pnlPct > 5%)
-   * to avoid premature exits on normal price noise.
+   * Only runs once the trailing stop has activated (pnlPct >= STRATEGY_TRAIL_ACTIVATION_PCT,
+   * same gate as position.trailActive). Previously this fired from pnlPct > 5%, which meant
+   * it competed with — and almost always pre-empted — the trailing stop and profit target:
+   * historically 57% of trades exited here at an average of just ~17% of the way to target,
+   * and zero trades ever reached TARGET_HIT. Gating on trailActive lets winners run to at
+   * least the trail-activation threshold before any early-exit logic can cut them short.
+   * The stop-loss path (monitorSinglePosition's stopHit check) is untouched, so max loss
+   * per trade is unaffected by this change — only how early winners can be harvested.
    *
    * Exit signals checked:
    *   1. Supertrend flipped against position direction
    *   2. EMA death cross (9 < 21) while LONG; golden cross while SHORT
-   *   3. RSI extreme exhaustion (> 82 while long, < 18 while short)
-   *   4. MACD histogram reversal (histogram turned against position for 2+ ticks)
+   *   3. RSI extreme exhaustion (> 87 while long, < 13 while short)
+   *   4. MACD histogram reversal (histogram turned against position, pnl > 18%)
    */
   private async checkTechnicalReversal(
     position: StrategyPosition,
     ltp: number,
     pnlPct: number,
   ): Promise<{ shouldExit: boolean; reason: string }> {
-    // Only intervene when we have meaningful profit (avoid noise exits)
-    if (pnlPct < 5) return { shouldExit: false, reason: '' };
+    // Only intervene once trailing stop is active — let winners breathe past the first 5-11%
+    if (!position.trailActive) return { shouldExit: false, reason: '' };
 
     const underlying = position.symbol.split('-')[0] ?? position.symbol;
     let prices: number[];
@@ -611,10 +617,10 @@ class ExecutionService {
 
     // 3. RSI exhaustion — only exit at extreme levels
     const rsi14 = rsi(prices, 14);
-    if (isBullishPosition && rsi14 > 82) {
+    if (isBullishPosition && rsi14 > 87) {
       return { shouldExit: true, reason: `TECH_REVERSAL: RSI exhaustion ${rsi14.toFixed(0)} while long CE (pnl=${pnlPct.toFixed(1)}%)` };
     }
-    if (!isBullishPosition && rsi14 < 18) {
+    if (!isBullishPosition && rsi14 < 13) {
       return { shouldExit: true, reason: `TECH_REVERSAL: RSI exhaustion ${rsi14.toFixed(0)} while long PE (pnl=${pnlPct.toFixed(1)}%)` };
     }
 
@@ -623,10 +629,10 @@ class ExecutionService {
     const { histogram: histPrev } = macd(prices.slice(0, -2));
     const macdTurningAgainstLong = isBullishPosition && histNow < 0 && histPrev > 0;
     const macdTurningAgainstShort = !isBullishPosition && histNow > 0 && histPrev < 0;
-    if (macdTurningAgainstLong && pnlPct > 12) {
+    if (macdTurningAgainstLong && pnlPct > 18) {
       return { shouldExit: true, reason: `TECH_REVERSAL: MACD histogram crossed below zero while long CE (pnl=${pnlPct.toFixed(1)}%)` };
     }
-    if (macdTurningAgainstShort && pnlPct > 12) {
+    if (macdTurningAgainstShort && pnlPct > 18) {
       return { shouldExit: true, reason: `TECH_REVERSAL: MACD histogram crossed above zero while long PE (pnl=${pnlPct.toFixed(1)}%)` };
     }
 

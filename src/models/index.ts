@@ -1,4 +1,4 @@
-import { sequelize } from '../config/database';
+import { Sequelize } from 'sequelize';
 import { initCandleModel } from './candle.model';
 import { initMarketTickModel } from './market-tick.model';
 import { initOAuthTokenModel } from './oauth-token.model';
@@ -12,7 +12,7 @@ import { initTradeIntentModel } from './trade-intent.model';
 import { initTradeOrderModel } from './trade-order.model';
 import { initWatchlistItemModel } from './watchlist-item.model';
 
-export const initModels = (): void => {
+export const initModels = (sequelize: Sequelize): void => {
   initOAuthTokenModel(sequelize);
   initMarketTickModel(sequelize);
   initCandleModel(sequelize);

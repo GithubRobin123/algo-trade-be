@@ -55,6 +55,13 @@ export const env = {
   frontendUrl: getString('FRONTEND_URL', 'http://localhost:5173'),
   databaseUrl: getString('DATABASE_URL', 'postgres://postgres:postgres@localhost:5432/upstox_trading'),
   dbLogging: getBoolean('DB_LOGGING', false),
+  // Secondary DB for auto-failover. Leave blank to disable failover entirely.
+  localDatabaseUrl: getString('LOCAL_DATABASE_URL', ''),
+  dbHealthCheckIntervalMs: getNumber('DB_HEALTH_CHECK_INTERVAL_MS', 15000),
+  // Consecutive failed health checks on the active DB before failing over
+  dbFailoverThreshold: getNumber('DB_FAILOVER_THRESHOLD', 2),
+  // Consecutive successful health checks on the primary before failing back
+  dbRecoveryThreshold: getNumber('DB_RECOVERY_THRESHOLD', 4),
 
   upstoxApiBaseUrl: getString('UPSTOX_API_BASE_URL', 'https://api.upstox.com'),
   upstoxClientId: getString('UPSTOX_CLIENT_ID', ''),
