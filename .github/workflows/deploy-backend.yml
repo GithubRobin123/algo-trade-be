@@ -1,0 +1,92 @@
+# Deploys the backend to the EC2 server.
+#
+# Manual for now: GitHub → Actions → "Deploy backend (EC2)" → Run workflow.
+# To deploy automatically on every push to main later, add under `on:`
+#   push:
+#     branches: [main]
+#
+# Repository secrets (Settings → Secrets and variables → Actions):
+#   EC2_HOST         public DNS / IP of the server
+#   EC2_USER         SSH user (ec2-user)
+#   EC2_SSH_KEY      private key of the deploy key (its public key is in ~/.ssh/authorized_keys on the server)
+#   EC2_KNOWN_HOSTS  the server's SSH host key line (pins the server identity)
+#
+# The pipeline talks to the server over SSH and checks health on the server itself, so it does not
+# depend on the public URL (Cloudflare tunnel today, your own domain later).
+
+name: Deploy backend (EC2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to deploy
+        required: true
+        default: main
+
+concurrency:
+  group: deploy-backend-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+
+  deploy:
+    name: Deploy to EC2
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Pre-flight check on server
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid branch name"; exit 1; }
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            "$EC2_USER@$EC2_HOST" "bash -s -- '$BRANCH' --check" < scripts/deploy.sh
+
+      - name: Deploy (pull, install, build, restart algo-backend only)
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            "$EC2_USER@$EC2_HOST" "bash -s -- '$BRANCH'" < scripts/deploy.sh
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

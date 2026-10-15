@@ -4,3 +4,5 @@ dist
 logs
 *.log
 coverage
+dist-next
+dist-prev
