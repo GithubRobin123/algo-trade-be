@@ -3,8 +3,10 @@ import app from './app';
 import { connectDatabase, dbManager } from './config/database';
 import { env } from './config/env';
 import { marketDataService } from './services/market-data.service';
+import { marketStreamService } from './services/market-stream.service';
 import { stockCatalogService } from './services/stock-catalog.service';
 import { strategyService } from './services/strategy.service';
+import { tokenRenewalService } from './services/token-renewal.service';
 import { websocketService } from './services/websocket.service';
 
 const bootstrap = async (): Promise<void> => {
@@ -16,8 +18,14 @@ const bootstrap = async (): Promise<void> => {
   const server = http.createServer(app);
 
   websocketService.init(server);
-  marketDataService.startPolling();
-  strategyService.start();
+  if (env.backgroundJobsEnabled) {
+    marketDataService.startPolling();
+    marketStreamService.start();
+    strategyService.start();
+    tokenRenewalService.start();
+  } else {
+    console.warn('[Boot] BACKGROUND_JOBS_ENABLED=false: API only (no market polling, strategy, execution monitor or token requests).');
+  }
 
   server.listen(env.port, () => {
     const host = process.env.NODE_ENV === 'production' ? '0.0.0.0' : 'localhost';
@@ -26,7 +34,9 @@ const bootstrap = async (): Promise<void> => {
 
   const shutdown = async (): Promise<void> => {
     marketDataService.stopPolling();
+    marketStreamService.stop();
     strategyService.stop();
+    tokenRenewalService.stop();
     websocketService.close();
     await dbManager.close();
     server.close(() => {

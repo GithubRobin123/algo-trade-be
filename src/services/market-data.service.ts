@@ -57,6 +57,15 @@ export function getLatestVix(): number {
   return cachedVix ?? 14;
 }
 
+/** Live VIX from the WebSocket stream (also stops the REST poll re-fetching it for a minute). */
+export function setLiveVix(vix: number): void {
+  cachedVix = vix;
+  vixFetchedAt = Date.now();
+}
+
+// While the WebSocket delivered the index within this window, the REST poll skips the index tick
+const STREAM_FRESH_MS = 10_000;
+
 // ── Option chain snapshot: only insert if last snapshot is >4 min old ─────
 const MIN_CHAIN_SNAPSHOT_GAP_MS = 4 * 60 * 1000;
 
@@ -67,6 +76,9 @@ class MarketDataService {
   // In-memory cache for option chain API responses — skips redundant HTTP calls within the snapshot gap
   private lastChainFetchAt = new Map<string, number>();
   private lastChainData = new Map<string, NormalizedOptionChain>();
+  private lotSizeCache = new Map<string, number>();
+  // Last time a tick for each instrument arrived from the WebSocket stream
+  private lastStreamTickAt = new Map<string, number>();
 
   startPolling(): void {
     if (this.pollTimer) return;
@@ -118,6 +130,7 @@ class MarketDataService {
 
     websocketService.broadcast('tick', payload);
     this.hasLoggedAuthWarning = false;
+    if (richPayload.source === 'upstox-ws') this.lastStreamTickAt.set(instrumentKey, Date.now());
     return { symbol: payload.symbol, instrumentKey: payload.instrumentKey, ltp: payload.ltp, sourceTimestamp: payload.sourceTimestamp };
   }
 
@@ -220,18 +233,41 @@ class MarketDataService {
     return this.getSessionTickHistory(limit, instrumentKey);
   }
 
-  /** Returns today's 5-minute candles, oldest first. */
+  /** Returns today's latest `limit` 5-minute candles, oldest first. */
   async getCandleHistory(limit: number, instrumentKey?: string): Promise<Candle[]> {
     const safeLimit = Math.min(Math.max(limit, 1), 200);
     const from = sessionStart();
     const where: WhereOptions = { candleStart: { [Op.gte]: from } };
     if (instrumentKey) (where as Record<string, unknown>).instrumentKey = instrumentKey;
 
-    return Candle.findAll({
+    // Newest first + limit, then reverse — so the latest candles are never cut off
+    const candles = await Candle.findAll({
       where,
-      order: [['candleStart', 'ASC']],
+      order: [['candleStart', 'DESC']],
       limit: safeLimit,
     });
+    return candles.reverse();
+  }
+
+  /** Exchange lot size of an underlying's options for one expiry (cached); `fallback` if Upstox has none. */
+  async getOptionLotSize(instrumentKey: string, expiryDate: string | null, fallback: number): Promise<number> {
+    const cacheKey = `${instrumentKey}:${expiryDate ?? 'any'}`;
+    const cached = this.lotSizeCache.get(cacheKey);
+    if (cached) return cached;
+
+    try {
+      const accessToken = await tokenService.getValidAccessToken();
+      const lotSize = await upstoxService.getOptionLotSize(accessToken, instrumentKey, expiryDate ?? undefined);
+      if (lotSize) {
+        if (lotSize !== fallback) {
+          process.stdout.write(`[Market] Lot size for ${instrumentKey} ${expiryDate ?? ''} is ${lotSize} (config fallback ${fallback}).\n`);
+        }
+        this.lotSizeCache.set(cacheKey, lotSize);
+        return lotSize;
+      }
+    } catch { /* fall back to configured lot size */ }
+
+    return fallback;
   }
 
   /** Fetch and store option chain. Inserts a new snapshot (not upsert) if last one is >4 min old. */
@@ -370,6 +406,7 @@ class MarketDataService {
     const underlyingPrice =
       toNumber(root.underlying_spot_price) ??
       toNumber(root.underlying_price) ??
+      toNumber((firstRow as Record<string, unknown>).underlying_spot_price) ??
       toNumber((firstRow as Record<string, unknown>).underlying_price);
 
     return { symbol, instrumentKey, underlyingPrice, expiryDate: inferredExpiry, snapshotTime: new Date().toISOString(), rows: normalizedRows };
@@ -423,9 +460,11 @@ class MarketDataService {
       }
 
       const active = underlyingService.getActive();
+      // The WebSocket stream already stores the index tick in real time; REST only fills gaps
+      const streamFresh = Date.now() - (this.lastStreamTickAt.get(active.instrumentKey) ?? 0) < STREAM_FRESH_MS;
 
       await Promise.allSettled([
-        this.fetchAndStoreTick(active.instrumentKey, active.symbol),
+        streamFresh ? Promise.resolve() : this.fetchAndStoreTick(active.instrumentKey, active.symbol),
         active.supportsOptions ? this.fetchAndStoreOptionChain(undefined, active.symbol) : Promise.resolve(),
       ]);
 

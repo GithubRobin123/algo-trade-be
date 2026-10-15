@@ -27,7 +27,9 @@ import { tradeIntentService } from './trade-intent.service';
 import { upstoxService } from './upstox.service';
 import { marketDataService } from './market-data.service';
 import { websocketService } from './websocket.service';
-import { atr, ema, rsi, macd, supertrend } from './strategy-registry.service';
+import { underlyingService } from './underlying.service';
+import { marketStreamService } from './market-stream.service';
+import { ema, rsi, macd, supertrend } from './strategy-registry.service';
 
 // ── EOD square-off time: 3:10 PM IST (5 min before market close) ──────────
 const EOD_SQUAREOFF_HOUR = 15;
@@ -52,8 +54,19 @@ function isEodSquareOffTime(): boolean {
 
 // ── Service ────────────────────────────────────────────────────────────────
 
-// Skip an instrument in the monitor after this many consecutive failures
+// After this many consecutive failures an instrument is retried with backoff (30s, 60s, … max 5 min)
+// instead of every 5s — avoids Upstox rate limits but never stops watching the stop loss.
 const MONITOR_FAILURE_LIMIT = 5;
+const MONITOR_BASE_BACKOFF_MS = 30 * 1000;
+const MONITOR_MAX_BACKOFF_MS = 5 * 60 * 1000;
+
+// Real-time (streamed) evaluation: exits are decided on every tick; bookkeeping is throttled
+const STREAM_PRICE_MAX_AGE_MS = 3_000;   // 5s cycle uses a streamed price this fresh instead of REST
+const LIVE_PERSIST_INTERVAL_MS = 1_000;  // save position + push to dashboard at most once per second
+const PNL_TICK_INTERVAL_MS = 5_000;      // P&L chart point at most every 5 seconds
+const SL_EVENT_INTERVAL_MS = 5_000;      // "trailing SL moved" event at most every 5 seconds
+const CACHE_RELOAD_GAP_MS = 2_000;
+const EXIT_RETRY_GAP_MS = 5_000;          // a failed exit order is retried at most this often
 
 class ExecutionService {
   private monitorTimer: NodeJS.Timeout | null = null;
@@ -61,8 +74,19 @@ class ExecutionService {
   // Using a date string instead of a boolean means the flag auto-resets every new trading day
   // without requiring a server restart — fixes the bug where positions stayed OPEN overnight.
   private eodSquareOffDate: string | null = null;
-  // Tracks consecutive monitor failures per instrumentKey to prevent Upstox rate limiting
-  private monitorFailures = new Map<string, number>();
+  // Consecutive monitor failures per instrumentKey and when to retry it next
+  private monitorFailures = new Map<string, { count: number; retryAt: number }>();
+  // Open positions shared by the 5s cycle and streamed ticks — one instance per position,
+  // so the in-memory best price / trailing SL is never lost between the two paths
+  private positionCache = new Map<number, StrategyPosition>();
+  private evaluating = new Set<number>();
+  private pendingLtp = new Map<number, number>();
+  private lastPersistAt = new Map<number, number>();
+  private lastPnlTickAt = new Map<number, number>();
+  private lastSlEventAt = new Map<number, number>();
+  private lastExitAttemptAt = new Map<number, number>();
+  private lastCacheReloadAt = 0;
+  private liveFeedAttached = false;
 
   private getIstDateString(): string {
     return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
@@ -81,11 +105,94 @@ class ExecutionService {
   start(): void {
     if (this.monitorTimer) return;
 
+    this.attachLiveFeed();
     this.monitorTimer = setInterval(() => {
       void this.runMonitorCycle();
     }, 5000); // Every 5 seconds
 
     void this.runMonitorCycle();
+  }
+
+  /** Subscribe to streamed prices: each tick of an open position is evaluated immediately. */
+  attachLiveFeed(): void {
+    if (this.liveFeedAttached) return;
+    this.liveFeedAttached = true;
+    marketStreamService.onPrice((instrumentKey, ltp) => {
+      this.onLivePrice(instrumentKey, ltp).catch((err: unknown) => {
+        process.stderr.write(`[Monitor] live tick ${instrumentKey}: ${String(err)}\n`);
+      });
+    });
+  }
+
+  /** Reload open positions into the shared cache (5s cycle, or when a new position starts ticking). */
+  async refreshOpenPositions(): Promise<StrategyPosition[]> {
+    this.lastCacheReloadAt = Date.now();
+    const rows = await StrategyPosition.findAll({
+      where: { status: 'OPEN' },
+      limit: 50,
+      order: [['createdAt', 'ASC']],
+    });
+
+    const next = new Map<number, StrategyPosition>();
+    for (const row of rows) {
+      const id = Number(row.id);
+      const cached = this.positionCache.get(id);
+      // Keep the in-memory instance: it may hold a newer best price / SL than the last save
+      next.set(id, cached && cached.status === 'OPEN' ? cached : row);
+    }
+    this.positionCache = next;
+    for (const map of [this.lastPersistAt, this.lastPnlTickAt, this.lastSlEventAt, this.lastExitAttemptAt, this.pendingLtp]) {
+      for (const id of map.keys()) if (!next.has(id)) map.delete(id);
+    }
+    return [...next.values()];
+  }
+
+  /** Streamed tick → check stop loss / target of every open position on that instrument now. */
+  private async onLivePrice(instrumentKey: string, ltp: number): Promise<void> {
+    const matches = [...this.positionCache.values()].filter(
+      (p) => p.instrumentKey === instrumentKey && p.status === 'OPEN',
+    );
+
+    // The feed only carries open-position options, so an unknown one is a position opened since the last reload
+    if (!matches.length && Date.now() - this.lastCacheReloadAt >= CACHE_RELOAD_GAP_MS) {
+      const refreshed = await this.refreshOpenPositions();
+      matches.push(...refreshed.filter((p) => p.instrumentKey === instrumentKey));
+    }
+
+    for (const position of matches) {
+      await this.evaluate(position, null, ltp, true);
+    }
+  }
+
+  /**
+   * One evaluation at a time per position. Ticks arriving meanwhile are not queued — only the
+   * latest is kept and evaluated right after, so a position always acts on the newest price.
+   */
+  private async evaluate(
+    position: StrategyPosition,
+    accessToken: string | null,
+    ltp: number | undefined,
+    live: boolean,
+  ): Promise<void> {
+    const id = Number(position.id);
+    if (this.evaluating.has(id)) {
+      if (live && ltp !== undefined) this.pendingLtp.set(id, ltp);
+      return;
+    }
+
+    this.evaluating.add(id);
+    try {
+      await this.monitorSinglePosition(position, accessToken, ltp, live);
+      let next = this.pendingLtp.get(id);
+      while (next !== undefined && position.status === 'OPEN' && this.positionCache.has(id)) {
+        this.pendingLtp.delete(id);
+        await this.monitorSinglePosition(position, null, next, true);
+        next = this.pendingLtp.get(id);
+      }
+    } finally {
+      this.pendingLtp.delete(id);
+      this.evaluating.delete(id);
+    }
   }
 
   stop(): void {
@@ -203,7 +310,7 @@ class ExecutionService {
         type: 'INTENT_CREATED',
         underlying,
         intentId,
-        reason: 'Pending manual approval — approve from dashboard within 10 minutes',
+        reason: `Pending manual approval — approve from dashboard within ${env.intentExpiryMinutes} minute(s)`,
       });
       return;
     }
@@ -342,11 +449,7 @@ class ExecutionService {
 
   // ── Position management with trailing SL ─────────────────────────────
   private async manageOpenPositions(): Promise<void> {
-    const openPositions = await StrategyPosition.findAll({
-      where: { status: 'OPEN' },
-      limit: 50,
-      order: [['createdAt', 'ASC']],
-    });
+    const openPositions = await this.refreshOpenPositions();
 
     if (!openPositions.length) return;
 
@@ -357,10 +460,19 @@ class ExecutionService {
       return; // No token — skip this cycle
     }
 
-    // Batch-fetch LTPs for all active positions in one API call (N→1 per cycle).
-    // Falls back gracefully: if batch fails, each position falls back to getNiftyLtp().
+    const now = Date.now();
+    const isBackingOff = (key: string): boolean => (this.monitorFailures.get(key)?.retryAt ?? 0) > now;
+
+    // Prefer the live streamed price; REST only for positions without a fresh streamed tick.
+    // Batch-fetch those LTPs in one API call (N→1 per cycle); if the batch fails, each
+    // position falls back to getNiftyLtp().
+    const streamed = new Map<string, number>();
+    for (const p of openPositions) {
+      const price = marketStreamService.getFreshPrice(p.instrumentKey, STREAM_PRICE_MAX_AGE_MS);
+      if (price !== null) streamed.set(p.instrumentKey, price);
+    }
     const activeKeys = openPositions
-      .filter((p) => (this.monitorFailures.get(p.instrumentKey) ?? 0) < MONITOR_FAILURE_LIMIT)
+      .filter((p) => !isBackingOff(p.instrumentKey) && !streamed.has(p.instrumentKey))
       .map((p) => p.instrumentKey);
 
     let batchQuotes: Record<string, { ltp: number | null; close: number | null; raw: Record<string, unknown> }> = {};
@@ -373,39 +485,60 @@ class ExecutionService {
     }
 
     for (const position of openPositions) {
-      const failures = this.monitorFailures.get(position.instrumentKey) ?? 0;
-      if (failures >= MONITOR_FAILURE_LIMIT) {
-        // Already failing repeatedly — skip to avoid Upstox rate limiting.
-        // Will auto-resume if position is closed or manually reset.
-        continue;
-      }
+      if (isBackingOff(position.instrumentKey)) continue;
 
       try {
-        const prefetchedLtp = batchQuotes[position.instrumentKey]?.ltp ?? undefined;
-        await this.monitorSinglePosition(position, accessToken, prefetchedLtp);
+        const prefetchedLtp = streamed.get(position.instrumentKey) ?? batchQuotes[position.instrumentKey]?.ltp ?? undefined;
+        await this.evaluate(position, accessToken, prefetchedLtp, false);
         // Clear failure count on success
         this.monitorFailures.delete(position.instrumentKey);
       } catch (err) {
-        const newCount = failures + 1;
-        this.monitorFailures.set(position.instrumentKey, newCount);
+        const count = (this.monitorFailures.get(position.instrumentKey)?.count ?? 0) + 1;
+        const backoffMs = count >= MONITOR_FAILURE_LIMIT
+          ? Math.min(MONITOR_MAX_BACKOFF_MS, MONITOR_BASE_BACKOFF_MS * 2 ** (count - MONITOR_FAILURE_LIMIT))
+          : 0;
+        this.monitorFailures.set(position.instrumentKey, { count, retryAt: Date.now() + backoffMs });
         process.stderr.write(
           '[Monitor] ' + position.instrumentKey + ': ' + String(err) +
-          (newCount >= MONITOR_FAILURE_LIMIT
-            ? ' — skipping this instrument (too many failures)\n'
-            : ' (failure ' + newCount + '/' + MONITOR_FAILURE_LIMIT + ')\n'),
+          (backoffMs > 0
+            ? ` — failure ${count}, retrying in ${Math.round(backoffMs / 1000)}s\n`
+            : ' (failure ' + count + '/' + MONITOR_FAILURE_LIMIT + ')\n'),
         );
+
+        if (count === MONITOR_FAILURE_LIMIT) {
+          await tradeEventService.emit({
+            type: 'SYSTEM_ERROR',
+            underlying: position.symbol.split('-')[0] ?? position.symbol,
+            positionId: Number(position.id),
+            symbol: position.symbol,
+            reason: `Monitoring ${position.symbol} failed ${count} times in a row — stop loss/target are NOT checked while it fails. Retrying with backoff. Last error: ${String(err)}`,
+          });
+        }
       }
     }
   }
 
+  /**
+   * Evaluate one position at a price. The exit decision comes first and acts on this exact
+   * price; bookkeeping (DB save, dashboard push, P&L chart point, events) follows.
+   * @param live true for a streamed tick (many per second): bookkeeping is throttled and the
+   *             slower technical-reversal check is left to the 5-second cycle.
+   */
   private async monitorSinglePosition(
     position: StrategyPosition,
-    accessToken: string,
+    accessToken: string | null,
     prefetchedLtp?: number | null,
+    live = false,
   ): Promise<void> {
-    const ltp = prefetchedLtp != null
-      ? prefetchedLtp
-      : (await upstoxService.getNiftyLtp(accessToken, position.instrumentKey)).ltp;
+    let ltp: number;
+    if (prefetchedLtp != null) {
+      ltp = prefetchedLtp;
+    } else if (accessToken) {
+      ltp = (await upstoxService.getNiftyLtp(accessToken, position.instrumentKey)).ltp;
+    } else {
+      throw new Error('No price available for ' + position.instrumentKey);
+    }
+    const positionId = Number(position.id);
     const entryPrice = Number(position.entryPrice);
     const underlying = position.symbol.split('-')[0] ?? position.symbol;
 
@@ -428,31 +561,14 @@ class ExecutionService {
     position.unrealizedPnl = unrealizedPnl;
     position.bestPrice = newBestPrice;
 
-    // Push live P&L to frontend via WebSocket immediately (no polling needed)
-    websocketService.broadcast('position_update', {
-      id: Number(position.id),
-      symbol: position.symbol,
-      instrumentKey: position.instrumentKey,
-      side: position.side,
-      quantity: position.quantity,
-      entryPrice: Number(position.entryPrice),
-      currentPrice: ltp,
-      unrealizedPnl,
-      unrealizedPnlPct: pnlPct,
-      stopLossPrice: Number(position.stopLossPrice),
-      targetPrice: Number(position.targetPrice),
-      trailActive: position.trailActive,
-      bestPrice: newBestPrice,
-      status: position.status,
-    });
-
-    // Trailing SL logic
+    // Trailing SL logic (in memory — saved below)
     let slUpdated = false;
+    let trailStarted = false;
+    let newSl = Number(position.stopLossPrice);
     if (pnlPct >= env.strategyTrailActivationPct) {
-      const wasActive = position.trailActive;
+      trailStarted = !position.trailActive;
       position.trailActive = true;
 
-      let newSl: number;
       if (position.side === 'BUY') {
         const trailFromBest = newBestPrice * (1 - env.strategyTrailOffsetPct / 100);
         const lockProfit = entryPrice * 1.01;
@@ -467,44 +583,90 @@ class ExecutionService {
         slUpdated = true;
         position.stopLossPrice = newSl;
       }
-
-      // Emit trail-started only once
-      if (!wasActive && position.trailActive) {
-        await tradeEventService.emit({
-          type: 'POSITION_TRAIL_STARTED',
-          underlying,
-          positionId: Number(position.id),
-          symbol: position.symbol,
-          price: ltp,
-          stopLossPrice: newSl,
-          pnl: unrealizedPnl,
-          pnlPct,
-          reason: `Trail activated at +${pnlPct.toFixed(1)}%, SL moved to ${newSl.toFixed(1)}`,
-        });
-      }
     }
 
-    await position.save();
+    // Exit checks FIRST — act on this exact price before any slower bookkeeping
+    const stopHit = position.side === 'BUY'
+      ? ltp <= Number(position.stopLossPrice)
+      : ltp >= Number(position.stopLossPrice);
 
-    // Write PnL tick for live chart
-    try {
-      await PositionPnlTick.create({
-        positionId: Number(position.id),
-        currentPremium: ltp,
+    const targetHit = position.side === 'BUY'
+      ? ltp >= Number(position.targetPrice)
+      : ltp <= Number(position.targetPrice);
+
+    const exitReason = stopHit
+      ? 'STOP_LOSS_HIT'
+      : targetHit || pnlPct >= env.strategyProfitTargetPct
+        ? 'TARGET_HIT'
+        : null;
+
+    const now = Date.now();
+    if (exitReason) {
+      // A failed exit (e.g. order rejected) is retried at most every 5s, not on every tick
+      if (now - (this.lastExitAttemptAt.get(positionId) ?? 0) < EXIT_RETRY_GAP_MS) return;
+      this.lastExitAttemptAt.set(positionId, now);
+      await position.save(); // the trigger price is the fallback exit price
+      await this.closePositionWithEvent(positionId, exitReason, underlying);
+      return;
+    }
+
+    // Bookkeeping — every 5s cycle; for streamed ticks at most once per second
+    if (!live || trailStarted || now - (this.lastPersistAt.get(positionId) ?? 0) >= LIVE_PERSIST_INTERVAL_MS) {
+      this.lastPersistAt.set(positionId, now);
+      await position.save();
+
+      websocketService.broadcast('position_update', {
+        id: positionId,
+        symbol: position.symbol,
+        instrumentKey: position.instrumentKey,
+        side: position.side,
+        quantity: position.quantity,
+        entryPrice: Number(position.entryPrice),
+        currentPrice: ltp,
         unrealizedPnl,
         unrealizedPnlPct: pnlPct,
         stopLossPrice: Number(position.stopLossPrice),
-        highWaterMark: newBestPrice,
+        targetPrice: Number(position.targetPrice),
         trailActive: position.trailActive,
+        bestPrice: newBestPrice,
+        status: position.status,
       });
-    } catch { /* non-critical */ }
+    }
 
-    // Emit SL update if it moved
-    if (slUpdated) {
+    // P&L point for the live chart
+    if (now - (this.lastPnlTickAt.get(positionId) ?? 0) >= PNL_TICK_INTERVAL_MS) {
+      this.lastPnlTickAt.set(positionId, now);
+      try {
+        await PositionPnlTick.create({
+          positionId,
+          currentPremium: ltp,
+          unrealizedPnl,
+          unrealizedPnlPct: pnlPct,
+          stopLossPrice: Number(position.stopLossPrice),
+          highWaterMark: newBestPrice,
+          trailActive: position.trailActive,
+        });
+      } catch { /* non-critical */ }
+    }
+
+    if (trailStarted) {
+      await tradeEventService.emit({
+        type: 'POSITION_TRAIL_STARTED',
+        underlying,
+        positionId,
+        symbol: position.symbol,
+        price: ltp,
+        stopLossPrice: newSl,
+        pnl: unrealizedPnl,
+        pnlPct,
+        reason: `Trail activated at +${pnlPct.toFixed(1)}%, SL moved to ${newSl.toFixed(1)}`,
+      });
+    } else if (slUpdated && now - (this.lastSlEventAt.get(positionId) ?? 0) >= SL_EVENT_INTERVAL_MS) {
+      this.lastSlEventAt.set(positionId, now);
       await tradeEventService.emit({
         type: 'POSITION_SL_UPDATED',
         underlying,
-        positionId: Number(position.id),
+        positionId,
         symbol: position.symbol,
         price: ltp,
         stopLossPrice: Number(position.stopLossPrice),
@@ -514,27 +676,8 @@ class ExecutionService {
       });
     }
 
-    // Exit checks
-    const stopHit = position.side === 'BUY'
-      ? ltp <= Number(position.stopLossPrice)
-      : ltp >= Number(position.stopLossPrice);
-
-    const targetHit = position.side === 'BUY'
-      ? ltp >= Number(position.targetPrice)
-      : ltp <= Number(position.targetPrice);
-
-    if (stopHit) {
-      await this.closePositionWithEvent(Number(position.id), 'STOP_LOSS_HIT', underlying);
-      return;
-    }
-
-    if (targetHit || pnlPct >= env.strategyProfitTargetPct) {
-      await this.closePositionWithEvent(Number(position.id), 'TARGET_HIT', underlying);
-      return;
-    }
-
-    // Technical reversal check — exit early if trend has reversed against us
-    // Only fires when pnlPct > 5% to avoid noise exits on small moves
+    // Technical reversal check (needs candle history) — 5s cycle only
+    if (live) return;
     try {
       const reversal = await this.checkTechnicalReversal(position, ltp, pnlPct);
       if (reversal.shouldExit) {
@@ -557,9 +700,9 @@ class ExecutionService {
    * The stop-loss path (monitorSinglePosition's stopHit check) is untouched, so max loss
    * per trade is unaffected by this change — only how early winners can be harvested.
    *
-   * Exit signals checked:
+   * Exit signals checked (on the index's 5-minute candle closes — the same data the entry used):
    *   1. Supertrend flipped against position direction
-   *   2. EMA death cross (9 < 21) while LONG; golden cross while SHORT
+   *   2. EMA death cross (9 < 21) while LONG; golden cross while SHORT (now vs 2 candles ago)
    *   3. RSI extreme exhaustion (> 87 while long, < 13 while short)
    *   4. MACD histogram reversal (histogram turned against position, pnl > 18%)
    */
@@ -575,22 +718,29 @@ class ExecutionService {
     let prices: number[];
 
     try {
-      // Get underlying index price history (not option prices)
-      const underlyingKey = position.metadata
-        ? (position.metadata as Record<string, unknown>).underlyingInstrumentKey as string | undefined
-        : undefined;
-      const history = await marketDataService.getTickHistory(50, underlyingKey);
-      if (history.length < 25) return { shouldExit: false, reason: '' };
-      prices = history.map((t) => t.ltp);
+      // Underlying index (not the option): from the intent metadata, else resolved from the symbol
+      const meta = (position.metadata ?? {}) as Record<string, unknown>;
+      const underlyingKey = typeof meta.underlyingInstrumentKey === 'string'
+        ? meta.underlyingInstrumentKey
+        : underlyingService.resolve(underlying).instrumentKey;
+
+      const candles = await marketDataService.getCandleHistory(100, underlyingKey);
+      if (candles.length >= 25) {
+        prices = candles.map((c) => Number(c.close));
+      } else {
+        // Early in the session: fall back to today's ticks of the same index
+        const history = await marketDataService.getSessionTickHistory(100, underlyingKey);
+        if (history.length < 25) return { shouldExit: false, reason: '' };
+        prices = history.map((t) => t.ltp);
+      }
     } catch {
       return { shouldExit: false, reason: '' };
     }
 
-    const isLong = position.side === 'BUY'; // BUY = long option (call or put)
     const isBullishPosition = position.symbol.endsWith('-CE'); // CE = expecting up move
 
-    // 1. Supertrend reversal
-    const stDir = supertrend(prices, 10, 3.0);
+    // 1. Supertrend reversal (shares direction state with the SUPERTREND entry strategy)
+    const stDir = supertrend(prices, 10, 3.0, underlying + '_ST');
     if (stDir) {
       const stBullish = stDir === 'BULLISH';
       if (isBullishPosition && !stBullish) {
@@ -665,9 +815,15 @@ class ExecutionService {
         metadata: { isExitIntent: true, positionId: position.id, exitReason: reason },
       });
 
-      const lastPrice = position.currentPrice !== null
-        ? Number(position.currentPrice)
-        : Number(position.entryPrice);
+      // Exit price: the exit order's fill (live average price / fresh paper LTP), else last monitored LTP
+      const exitOrder = exitIntent.executedOrderId ? await TradeOrder.findByPk(exitIntent.executedOrderId) : null;
+      const exitFill = exitOrder?.price !== null && exitOrder?.price !== undefined ? Number(exitOrder.price) : null;
+      const lastPrice = exitFill !== null && exitFill > 0
+        ? exitFill
+        : position.currentPrice !== null
+          ? Number(position.currentPrice)
+          : Number(position.entryPrice);
+      position.currentPrice = lastPrice;
 
       const realizedPnl = position.side === 'BUY'
         ? (lastPrice - Number(position.entryPrice)) * position.quantity
@@ -681,6 +837,11 @@ class ExecutionService {
       position.realizedPnl = realizedPnl;
       position.unrealizedPnl = 0;
       await position.save();
+
+      // Stop streamed ticks from evaluating it any further
+      const cached = this.positionCache.get(positionId);
+      if (cached) cached.status = 'CLOSED';
+      this.positionCache.delete(positionId);
 
       // Notify frontend immediately so P&L panel disappears without polling
       websocketService.broadcast('position_update', {

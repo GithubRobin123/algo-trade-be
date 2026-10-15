@@ -10,6 +10,7 @@
  */
 
 import { env } from '../config/env';
+import { atrStopLossPct } from './strategy-registry.service';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -90,8 +91,8 @@ Holding period: intraday only (minutes to a few hours).
 Square-off before 3:15 PM IST.
 
 INDIAN MARKET CONTEXT:
-- Nifty options: 50-point strike intervals, lot size 75
-- Sensex options: 100-point strike intervals, lot size 10
+- Nifty options: 50-point strike intervals
+- Sensex options: 100-point strike intervals
 - VWAP is the most critical intraday level — price above VWAP = bullish bias
 - Theta decay accelerates after 2 PM IST — penalise late entries strongly
 - Weekly expiry: NEVER buy on expiry day (extreme theta)
@@ -163,7 +164,7 @@ function buildUserPrompt(p: AiDecisionParams): string {
   const newIndicators = [adxNote, stNote, bbNote, stochNote, atrNote]
     .filter(Boolean).map(l => `  ${l}`).join('\n');
 
-  const slPct = p.atr14 ? Math.min(30, Math.max(10, (p.atr14 / p.currentPrice) * 250)) : 20;
+  const slPct = atrStopLossPct(p.optionPremium, p.atr14 ?? 0) * 100;
   const slLevel = (p.optionPremium * (1 - slPct / 100)).toFixed(1);
 
   return `TRADE SETUP ANALYSIS — ${p.index}

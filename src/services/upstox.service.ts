@@ -102,6 +102,51 @@ export class UpstoxService {
     }
   }
 
+  /**
+   * Upstox "Access Token Request" (v3). Sends an approval prompt to the account holder's
+   * Upstox app + WhatsApp. On approval Upstox POSTs the new token to the Notifier Webhook
+   * URL configured on the Upstox app — no OTP / PIN login needed.
+   */
+  async requestAccessToken(): Promise<{ authorizationExpiry: Date | null; notifierUrl: string | null }> {
+    if (!env.upstoxClientId || !env.upstoxClientSecret) {
+      throw new ApiError(500, 'UPSTOX_CLIENT_ID and UPSTOX_CLIENT_SECRET must be set to request an access token.');
+    }
+
+    try {
+      const { data } = await this.client.post<Record<string, unknown>>(
+        `/v3/login/auth/token/request/${encodeURIComponent(env.upstoxClientId)}`,
+        { client_secret: env.upstoxClientSecret },
+        { headers: { 'Content-Type': 'application/json', Accept: 'application/json' } },
+      );
+
+      const root = asRecord(data.data ?? data);
+      const expiryMs = toNumber(root.authorization_expiry);
+
+      return {
+        authorizationExpiry: expiryMs !== null ? new Date(expiryMs) : null,
+        notifierUrl: toText(root.notifier_url),
+      };
+    } catch (error) {
+      throw this.toApiError(error, 'Failed to request Upstox access token');
+    }
+  }
+
+  /** One-time wss:// URL for the Market Data Feed V3 WebSocket (each connect needs a fresh one). */
+  async authorizeMarketFeed(accessToken: string): Promise<string> {
+    try {
+      const { data } = await this.client.get<Record<string, unknown>>('/v3/feed/market-data-feed/authorize', {
+        headers: this.authHeaders(accessToken, API_VERSION_V3),
+      });
+      const root = asRecord(data.data ?? data);
+      const url = toText(root.authorized_redirect_uri ?? root.authorizedRedirectUri);
+      if (!url) throw new ApiError(502, 'Upstox feed authorize response had no authorized_redirect_uri.');
+      return url;
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw this.toApiError(error, 'Failed to authorize Upstox market data feed');
+    }
+  }
+
   async refreshToken(refreshToken: string): Promise<UpstoxOAuthTokenResponse> {
     this.ensureOAuthConfig();
 
@@ -223,14 +268,33 @@ export class UpstoxService {
     }
   }
 
+  async getOptionContracts(
+    accessToken: string,
+    instrumentKey: string,
+    expiryDate?: string,
+  ): Promise<Record<string, unknown>[]> {
+    const { data } = await this.client.get<Record<string, unknown>>('/v2/option/contract', {
+      headers: this.authHeaders(accessToken, API_VERSION_V2),
+      params: { instrument_key: instrumentKey, ...(expiryDate ? { expiry_date: expiryDate } : {}) },
+    });
+
+    return Array.isArray(data.data) ? (data.data as Record<string, unknown>[]) : [];
+  }
+
+  /** Exchange lot size of the option contracts for an underlying/expiry (null if unavailable). */
+  async getOptionLotSize(accessToken: string, instrumentKey: string, expiryDate?: string): Promise<number | null> {
+    try {
+      const contracts = await this.getOptionContracts(accessToken, instrumentKey, expiryDate);
+      const lotSize = contracts.map((c) => toNumber(c.lot_size)).find((v): v is number => v !== null && v > 0);
+      return lotSize ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async getAvailableExpiries(accessToken: string, instrumentKey: string): Promise<string[]> {
     try {
-      const { data } = await this.client.get<Record<string, unknown>>('/v2/option/contract', {
-        headers: this.authHeaders(accessToken, API_VERSION_V2),
-        params: { instrument_key: instrumentKey },
-      });
-
-      const contracts = Array.isArray(data.data) ? (data.data as Record<string, unknown>[]) : [];
+      const contracts = await this.getOptionContracts(accessToken, instrumentKey);
       const expiries = [...new Set(contracts.map((c) => c.expiry as string))]
         .filter(Boolean)
         .sort();
@@ -441,6 +505,31 @@ export class UpstoxService {
     }
   }
 
+  /** Status and average fill price of one order (orders are kept by Upstox for the trading day). */
+  async getOrderDetails(accessToken: string, orderId: string): Promise<{
+    status: string | null;
+    averagePrice: number | null;
+    filledQuantity: number | null;
+    statusMessage: string | null;
+  }> {
+    try {
+      const { data } = await this.client.get<Record<string, unknown>>('/v2/order/details', {
+        headers: this.authHeaders(accessToken, API_VERSION_V2),
+        params: { order_id: orderId },
+      });
+
+      const root = asRecord(data.data ?? data);
+      return {
+        status: toText(root.status),
+        averagePrice: toNumber(root.average_price),
+        filledQuantity: toNumber(root.filled_quantity),
+        statusMessage: toText(root.status_message),
+      };
+    } catch (error) {
+      throw this.toApiError(error, 'Failed to fetch order details from Upstox');
+    }
+  }
+
   /**
    * Emergency exit: cancel all open orders, then place SELL/BUY-back market orders
    * for every open position. Bypasses all strategy logic.
@@ -566,6 +655,13 @@ export class UpstoxService {
     } else if (/invalid auth code/i.test(rawMessage)) {
       message =
         'Invalid or already-used OAuth code. Restart Upstox login and exchange the new code immediately.';
+    } else if (/invalid notifier url/i.test(rawMessage)) {
+      let webhookUrl = 'https://<your-backend>/api/auth/upstox/callback';
+      try {
+        webhookUrl = `${new URL(env.upstoxRedirectUri).origin}/api/auth/upstox/callback`;
+      } catch { /* keep placeholder */ }
+      message =
+        `Your Upstox app has no Notifier Webhook URL. In the Upstox developer console, edit the app, set Notifier Webhook URL to ${webhookUrl}, save, then try again.`;
     } else if (/client_id.+redirect_uri.+incorrect/i.test(rawMessage)) {
       message =
         "Upstox rejected client_id/redirect_uri. Ensure both exactly match the app configuration in Upstox Developer Console.";

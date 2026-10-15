@@ -110,6 +110,21 @@ class TradeIntentService {
       throw new ApiError(410, `Intent ${id} has expired.`);
     }
 
+    // Refuse a second same-side position on a symbol BEFORE placing the order — otherwise the
+    // order would be filled at the broker but never tracked (no position row, no SL/target/exit).
+    const intentMeta = (intent.metadata ?? {}) as Record<string, unknown>;
+    if (intentMeta.isExitIntent !== true) {
+      const openSameSide = await StrategyPosition.count({
+        where: { status: 'OPEN', symbol: intent.symbol, side: intent.side },
+      });
+      if (openSameSide > 0) {
+        intent.status = 'REJECTED';
+        intent.rejectedReason = `An open ${intent.side} position for ${intent.symbol} already exists`;
+        await intent.save();
+        throw new ApiError(409, `An open ${intent.side} position for ${intent.symbol} already exists. Close it first.`);
+      }
+    }
+
     intent.status = 'APPROVED';
     intent.approvedBy = approvedBy;
     intent.approvedAt = new Date();
@@ -209,14 +224,22 @@ class TradeIntentService {
       return;
     }
 
+    // SL/target were planned on the signal's premium (option chain, up to a few minutes old).
+    // Keep the same % distances but measure them from the real entry price.
+    const signalEntry = this.toNumber(metadata.entryPrice);
+    const rebase = (planned: number | null): number | null =>
+      planned !== null && signalEntry !== null && signalEntry > 0
+        ? entryPrice * (planned / signalEntry)
+        : planned;
+
+    // Fallbacks for trades without a plan (manual): SL below / target above for BUY, mirrored for SELL
+    const direction = intent.side === 'BUY' ? 1 : -1;
     const stopLossPrice =
-      this.toNumber(metadata.stopLossPrice) ??
-      this.toNumber(metadata.suggestedStopLoss) ??
-      entryPrice * (1 - env.strategyEntryStopLossPct / 100);
+      rebase(this.toNumber(metadata.stopLossPrice) ?? this.toNumber(metadata.suggestedStopLoss)) ??
+      entryPrice * (1 - direction * env.strategyEntryStopLossPct / 100);
     const targetPrice =
-      this.toNumber(metadata.targetPrice) ??
-      this.toNumber(metadata.suggestedTarget) ??
-      entryPrice * (1 + env.strategyProfitTargetPct / 100);
+      rebase(this.toNumber(metadata.targetPrice) ?? this.toNumber(metadata.suggestedTarget)) ??
+      entryPrice * (1 + direction * env.strategyProfitTargetPct / 100);
 
     await StrategyPosition.create({
       symbol: intent.symbol,

@@ -7,6 +7,9 @@ import { accountService } from './account.service';
 import { tokenService } from './token.service';
 import { upstoxService } from './upstox.service';
 
+const FILL_POLL_ATTEMPTS = 5;
+const FILL_POLL_INTERVAL_MS = 700;
+
 export interface PlaceOrderRequest {
   symbol: string;
   instrumentKey: string;
@@ -87,28 +90,9 @@ class OrderService {
 
     const accessToken = await tokenService.getValidAccessToken();
 
+    let response: Record<string, unknown>;
     try {
-      const response = await upstoxService.placeOrder(accessToken, payload);
-      const providerOrderId = this.extractProviderOrderId(response);
-
-      return TradeOrder.create({
-        provider: 'upstox',
-        providerOrderId,
-        side,
-        symbol: input.symbol,
-        instrumentKey: input.instrumentKey,
-        quantity: input.quantity,
-        product: payload.product,
-        orderType: payload.order_type,
-        validity: payload.validity,
-        price: input.price ?? null,
-        triggerPrice: input.triggerPrice ?? null,
-        status: 'PLACED',
-        isPaper: false,
-        requestPayload: payload,
-        responsePayload: response,
-        errorMessage: null,
-      });
+      response = await upstoxService.placeOrder(accessToken, payload);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Order placement failed';
 
@@ -133,6 +117,56 @@ class OrderService {
 
       throw new ApiError(502, message);
     }
+
+    // Accepted by the API ≠ filled: read the real average price and catch RMS rejections
+    // (e.g. margin, lot size), so a rejected order never opens or closes a position.
+    const providerOrderId = this.extractProviderOrderId(response);
+    const fill = providerOrderId ? await this.waitForFinalStatus(accessToken, providerOrderId) : null;
+    const rejected = fill?.status === 'rejected' || fill?.status === 'cancelled';
+
+    const order = await TradeOrder.create({
+      provider: 'upstox',
+      providerOrderId,
+      side,
+      symbol: input.symbol,
+      instrumentKey: input.instrumentKey,
+      quantity: input.quantity,
+      product: payload.product,
+      orderType: payload.order_type,
+      validity: payload.validity,
+      price: !rejected && fill?.averagePrice ? fill.averagePrice : input.price ?? null,
+      triggerPrice: input.triggerPrice ?? null,
+      status: rejected ? 'REJECTED' : fill?.status === 'complete' ? 'COMPLETE' : 'PLACED',
+      isPaper: false,
+      requestPayload: payload,
+      responsePayload: response,
+      errorMessage: rejected ? fill?.statusMessage ?? `Order ${fill?.status} by Upstox` : null,
+    });
+
+    if (rejected) {
+      throw new ApiError(400, `Upstox ${fill?.status} the order: ${fill?.statusMessage ?? 'no reason given'}`);
+    }
+
+    return order;
+  }
+
+  /** Poll order details until complete/rejected/cancelled (MARKET orders settle in ~1s); null if still open. */
+  private async waitForFinalStatus(accessToken: string, orderId: string): Promise<{
+    status: string;
+    averagePrice: number | null;
+    statusMessage: string | null;
+  } | null> {
+    for (let attempt = 0; attempt < FILL_POLL_ATTEMPTS; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, FILL_POLL_INTERVAL_MS));
+      try {
+        const details = await upstoxService.getOrderDetails(accessToken, orderId);
+        const status = details.status?.toLowerCase() ?? '';
+        if (status === 'complete' || status === 'rejected' || status === 'cancelled') {
+          return { status, averagePrice: details.averagePrice, statusMessage: details.statusMessage };
+        }
+      } catch { /* keep polling */ }
+    }
+    return null;
   }
 
   async listOrders(limit: number): Promise<TradeOrder[]> {

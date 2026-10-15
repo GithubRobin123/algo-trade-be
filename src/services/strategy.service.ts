@@ -237,8 +237,8 @@ class StrategyService {
         latestIndexPrice = fetched?.ltp ?? null;
       }
 
-      // Primary: 5-min candles (session-only)
-      const candles = await marketDataService.getCandleHistory(60, underlying.instrumentKey);
+      // Primary: 5-min candles (session-only; a full session is 75 candles)
+      const candles = await marketDataService.getCandleHistory(100, underlying.instrumentKey);
       // Fallback: session-only ticks
       const history = await marketDataService.getSessionTickHistory(100, underlying.instrumentKey);
 
@@ -291,6 +291,8 @@ class StrategyService {
         : lastPrice; // fallback to current if no candle data yet
 
       const vix = getLatestVix();
+      // Exchange lot size for this expiry (lot sizes are revised by NSE/BSE); config value is the fallback
+      const lotSize = await marketDataService.getOptionLotSize(underlying.optionChainInstrumentKey, chain.expiryDate, underlying.defaultLotSize);
 
       strategyContext = {
         underlying: sym,
@@ -306,7 +308,7 @@ class StrategyService {
         expiryDate: chain.expiryDate,
         timeIST,
         minutesToClose,
-        lotSize: underlying.defaultLotSize,
+        lotSize,
         atmCallOi,
         atmPutOi,
         atmIv: atmIv ?? null,
@@ -381,10 +383,23 @@ class StrategyService {
 
     const ruleResult = computeRuleBasedDecision(ruleParams);
 
-    if (ruleResult.action === 'SKIP' && !env.aiEnabled) {
-      await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'LOW_CONFIDENCE', rejectionReason: `Rules SKIP. Bull=${ruleResult.rawBullScore} Bear=${ruleResult.rawBearScore}`, confidence: signal.confidence, signalSource: signal.source, rationale: signal.rationale, signalMetadata: { ...signal.metadata, ruleSignals: ruleResult.signals, strategyName }, latencyMs: Date.now() - cycleStart });
-      await tradeEventService.emit({ type: 'SIGNAL_REJECTED', underlying: sym, reason: 'Rule-based skip', strategy: strategyName, metadata: { ruleSignals: ruleResult.signals } });
-      return { signal, intentId: null, logId: null, decisionSource: 'rules-skip', strategyName };
+    // The rule scorer is the gate whenever the AI does not decide: AI off, provider 'none',
+    // no API key, or the AI call failed. It blocks SKIP and opposite-direction verdicts.
+    const strategySide = optionType === 'CALL' ? 'BUY_CALL' : 'BUY_PUT';
+    const rulesBlockReason = ruleResult.action === 'SKIP'
+      ? 'Rules SKIP'
+      : ruleResult.action !== strategySide
+        ? `Rules favour ${ruleResult.action} but strategy wants ${strategySide}`
+        : null;
+    const rejectByRules = async (source: string) => {
+      await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'LOW_CONFIDENCE', rejectionReason: `${rulesBlockReason}. Bull=${ruleResult.rawBullScore} Bear=${ruleResult.rawBearScore}`, confidence: signal.confidence, signalSource: signal.source, rationale: signal.rationale, signalMetadata: { ...signal.metadata, ruleSignals: ruleResult.signals, strategyName }, latencyMs: Date.now() - cycleStart });
+      await tradeEventService.emit({ type: 'SIGNAL_REJECTED', underlying: sym, reason: `Rule-based: ${rulesBlockReason}`, strategy: strategyName, metadata: { ruleSignals: ruleResult.signals } });
+      return { signal, intentId: null, logId: null, decisionSource: source, strategyName };
+    };
+
+    const aiWillRun = env.aiEnabled && env.aiProvider !== 'none' && Boolean(env.aiApiKey);
+    if (!aiWillRun && env.strategyRulesGateEnabled && rulesBlockReason) {
+      return rejectByRules('rules-skip');
     }
 
     // 8. Confidence gate
@@ -399,7 +414,7 @@ class StrategyService {
     let decisionSource = 'rules-only';
     let aiProvider: string | null = null;
 
-    if (env.aiEnabled && env.aiProvider !== 'none') {
+    if (aiWillRun) {
       const aiResult = await getAiTradeDecision(ruleParams);
       aiLatencyMs = aiResult.latencyMs;
       aiProvider = aiResult.provider;
@@ -423,6 +438,9 @@ class StrategyService {
         decisionSource = 'hybrid-rules+ai';
       } else {
         decisionSource = 'rules-fallback';
+        if (env.strategyRulesGateEnabled && rulesBlockReason) {
+          return rejectByRules('rules-fallback-skip');
+        }
       }
     }
 
@@ -440,9 +458,10 @@ class StrategyService {
         instrumentKey: signal.instrumentKey, quantity: signal.quantity,
         orderType: 'MARKET', product: 'I', validity: 'DAY',
         tag: 'auto-' + Date.now(), confidence: finalConfidence, rationale: signal.rationale,
-        requiresApproval: env.requireTradeApproval, expiresInMinutes: 2,
+        requiresApproval: env.requireTradeApproval, expiresInMinutes: env.intentExpiryMinutes,
         metadata: {
           ...signal.metadata, entryPrice: signal.entryPrice,
+          underlyingInstrumentKey: underlying.instrumentKey,
           stopLossPrice: signal.suggestedStopLoss, targetPrice: signal.suggestedTarget,
           trailActivationPct: env.strategyTrailActivationPct, trailOffsetPct: env.strategyTrailOffsetPct,
           strategyDate: sameDayIso(), decisionSource, strategyName, ruleSignals: ruleResult.signals,

@@ -1,6 +1,7 @@
 ﻿import { NextFunction, Request, Response } from 'express';
 import { ApiError } from '../middleware/error.middleware';
 import { marketDataService } from '../services/market-data.service';
+import { marketStreamService } from '../services/market-stream.service';
 import { underlyingService } from '../services/underlying.service';
 
 const parseLimit = (value: unknown, fallback: number): number => {
@@ -36,6 +37,11 @@ const resolveUnderlyingForOption = (req: Request): string => {
   const instrument = typeof req.query.instrumentKey === 'string' ? req.query.instrumentKey : undefined;
 
   return symbol ?? instrument ?? underlyingService.getActive().symbol;
+};
+
+/** Real-time feed health: state, subscribed instruments, last message, ticks received, last error. */
+export const getStreamStatus = (_req: Request, res: Response): void => {
+  res.json({ success: true, data: marketStreamService.getStatus() });
 };
 
 // Simple in-memory cache for overview — refreshed only during market hours

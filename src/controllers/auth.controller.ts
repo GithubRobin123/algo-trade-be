@@ -2,6 +2,7 @@
 import { NextFunction, Request, Response } from 'express';
 import { env, envMeta } from '../config/env';
 import { ApiError } from '../middleware/error.middleware';
+import { tokenRenewalService } from '../services/token-renewal.service';
 import { tokenService } from '../services/token.service';
 import { upstoxService } from '../services/upstox.service';
 
@@ -130,6 +131,36 @@ export const handleUpstoxNotifierCallback = async (
       return;
     }
 
+    // Anyone can POST to this URL, so only store a token that is for this app and actually works.
+    const messageType = body.message_type as string | undefined;
+    if (messageType && messageType !== 'access_token') {
+      res.status(202).json({ success: true, message: `Ignored notifier message_type '${messageType}'.` });
+      return;
+    }
+
+    const clientId = (body.client_id as string | undefined) ?? (body.clientId as string | undefined);
+    if (clientId && clientId !== env.upstoxClientId) {
+      console.warn('[Upstox Notifier] rejected token for a different client_id');
+      throw new ApiError(403, 'Notifier token is for a different Upstox app.');
+    }
+
+    let profileUserId: string | null = null;
+    try {
+      profileUserId = (await upstoxService.getUserProfile(accessToken)).userId;
+    } catch (verifyError) {
+      if (verifyError instanceof ApiError && (verifyError.statusCode === 401 || verifyError.statusCode === 403)) {
+        console.warn('[Upstox Notifier] rejected token: Upstox did not accept it');
+        throw new ApiError(401, 'Notifier token was rejected by Upstox.');
+      }
+      console.warn('[Upstox Notifier] could not verify token (Upstox unreachable), storing it anyway');
+    }
+
+    const tokenUserId = profileUserId ?? (body.user_id as string | undefined) ?? null;
+    if (env.upstoxUserId && tokenUserId && tokenUserId !== env.upstoxUserId) {
+      console.warn('[Upstox Notifier] rejected token for a different Upstox user');
+      throw new ApiError(403, 'Notifier token belongs to a different Upstox user.');
+    }
+
     await tokenService.saveNotifierToken({
       accessToken,
       tokenType:
@@ -162,8 +193,26 @@ export const getAuthStatus = async (_req: Request, res: Response): Promise<void>
 
   res.json({
     success: true,
-    data: status,
+    data: { ...status, renewal: tokenRenewalService.getStatus() },
   });
+};
+
+/** Send the "approve access token" prompt to the Upstox app / WhatsApp now (no OTP login). */
+export const requestUpstoxTokenApproval = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const renewal = await tokenRenewalService.requestNow('dashboard');
+    res.json({
+      success: true,
+      message: 'Approval request sent. Tap Approve in the Upstox app or WhatsApp to connect.',
+      data: renewal,
+    });
+  } catch (error) {
+    next(error);
+  }
 };
 
 export const getAuthDebug = async (_req: Request, res: Response): Promise<void> => {

@@ -174,6 +174,11 @@ export function bollingerBands(prices: number[], period = 20, multiplier = 2): {
   return { upper, middle, lower, bandwidth, percentB };
 }
 
+/**
+ * Wilder ADX over the whole series (close-to-close moves). The DX series runs bar by bar up
+ * to the latest price, so the newest candles always count — the previous windowed version
+ * stopped at the middle of the series and ignored the most recent data.
+ */
 export function adx(prices: number[], period = 14): { adx: number; trending: boolean } {
   if (prices.length < period * 2) return { adx: 0, trending: false };
   const dmPlus: number[] = [], dmMinus: number[] = [], trValues: number[] = [];
@@ -183,32 +188,29 @@ export function adx(prices: number[], period = 14): { adx: number; trending: boo
     dmMinus.push(diff < 0 ? Math.abs(diff) : 0);
     trValues.push(Math.abs(diff));
   }
-  const smooth = (arr: number[]): number => {
-    let rma = avg(arr.slice(0, period));
-    for (let i = period; i < arr.length; i++) rma = (rma * (period - 1) + arr[i]) / period;
-    return rma;
-  };
-  const atrVal = smooth(trValues);
-  if (atrVal === 0) return { adx: 0, trending: false };
-  const diPlus = (smooth(dmPlus) / atrVal) * 100;
-  const diMinus = (smooth(dmMinus) / atrVal) * 100;
-  const dxVal = diPlus + diMinus > 0 ? (Math.abs(diPlus - diMinus) / (diPlus + diMinus)) * 100 : 0;
+
+  // Wilder running sums: seed with the first `period` values, then S = S − S/period + x
+  let sTr = trValues.slice(0, period).reduce((s, v) => s + v, 0);
+  let sPlus = dmPlus.slice(0, period).reduce((s, v) => s + v, 0);
+  let sMinus = dmMinus.slice(0, period).reduce((s, v) => s + v, 0);
   const dx: number[] = [];
-  const halfLen = Math.floor(prices.length / 2);
-  for (let w = period; w <= halfLen; w++) {
-    const s = prices.slice(w - period, w + period);
-    const dm1: number[] = [], dm2: number[] = [], tr1: number[] = [];
-    for (let i = 1; i < s.length; i++) {
-      const d = s[i] - s[i - 1];
-      dm1.push(d > 0 ? d : 0); dm2.push(d < 0 ? Math.abs(d) : 0); tr1.push(Math.abs(d));
-    }
-    const atrW = smooth(tr1);
-    if (atrW === 0) continue;
-    const dp = (smooth(dm1) / atrW) * 100;
-    const dn = (smooth(dm2) / atrW) * 100;
-    dx.push(dp + dn > 0 ? (Math.abs(dp - dn) / (dp + dn)) * 100 : 0);
+  const pushDx = (): void => {
+    if (sTr === 0) { dx.push(0); return; }
+    const diPlus = (sPlus / sTr) * 100;
+    const diMinus = (sMinus / sTr) * 100;
+    dx.push(diPlus + diMinus > 0 ? (Math.abs(diPlus - diMinus) / (diPlus + diMinus)) * 100 : 0);
+  };
+  pushDx();
+  for (let i = period; i < trValues.length; i++) {
+    sTr = sTr - sTr / period + trValues[i];
+    sPlus = sPlus - sPlus / period + dmPlus[i];
+    sMinus = sMinus - sMinus / period + dmMinus[i];
+    pushDx();
   }
-  const adxVal = dx.length > 0 ? avg(dx.slice(-period)) : dxVal;
+
+  // ADX = Wilder average of DX
+  let adxVal = avg(dx.slice(0, period));
+  for (let i = period; i < dx.length; i++) adxVal = (adxVal * (period - 1) + dx[i]) / period;
   return { adx: Math.min(100, adxVal), trending: adxVal > 20 };
 }
 
@@ -274,11 +276,24 @@ export function stochastic(prices: number[], period = 14, smoothing = 3): { k: n
   return { k: kLast, d: dLast };
 }
 
-/** ATR-based dynamic stop loss. Clamps SL between 10% and 30% of entry premium. */
-function atrStopLoss(optionLtp: number, underlyingAtr: number, lastPrice: number): number {
-  const atrPct = lastPrice > 0 ? underlyingAtr / lastPrice : 0;
-  const slPct = Math.min(0.30, Math.max(0.10, atrPct * 2.5));
-  return optionLtp * (1 - slPct);
+// An ATM option moves roughly half as many points as the index
+const ATM_DELTA = 0.5;
+
+/**
+ * ATR-based stop-loss distance as a fraction of the option premium. The index ATR is first
+ * converted to premium points (× ATM delta) — comparing index-ATR% with premium% always hit
+ * the floor, so the stop was a fixed 10%. Clamped to STRATEGY_SL_MIN_PCT … STRATEGY_SL_MAX_PCT.
+ */
+export function atrStopLossPct(optionLtp: number, underlyingAtr: number): number {
+  const minPct = env.strategySlMinPct / 100;
+  const maxPct = Math.max(minPct, env.strategySlMaxPct / 100);
+  if (optionLtp <= 0 || underlyingAtr <= 0) return minPct;
+  const premiumAtr = underlyingAtr * ATM_DELTA;
+  return Math.min(maxPct, Math.max(minPct, (premiumAtr * env.strategySlAtrMultiplier) / optionLtp));
+}
+
+function atrStopLoss(optionLtp: number, underlyingAtr: number): number {
+  return optionLtp * (1 - atrStopLossPct(optionLtp, underlyingAtr));
 }
 
 // ── Strategy 1: SUPERTREND ─────────────────────────────────────────────────
@@ -326,7 +341,7 @@ const supertrendStrategy: StrategyPlugin = {
     if (confidence < env.strategyConfidenceThreshold) return null;
 
     const atrVal = atr(prices, 14);
-    const sl = atrStopLoss(optionLtp, atrVal, lastPrice);
+    const sl = atrStopLoss(optionLtp, atrVal);
     const { macdLine, signalLine, histogram } = macd(prices);
 
     return {
@@ -388,7 +403,7 @@ const emaCrossStrategy: StrategyPlugin = {
     if (confidence < env.strategyConfidenceThreshold) return null;
 
     const atrVal = atr(prices, 14);
-    const sl = atrStopLoss(optionLtp, atrVal, lastPrice);
+    const sl = atrStopLoss(optionLtp, atrVal);
     const { macdLine, signalLine, histogram } = macd(prices);
     const vwapVal = sessionVwap(ctx);
 
@@ -450,7 +465,7 @@ const vwapBounceStrategy: StrategyPlugin = {
     if (confidence < env.strategyConfidenceThreshold) return null;
 
     const atrVal = atr(prices, 14);
-    const sl = atrStopLoss(optionLtp, atrVal, lastPrice);
+    const sl = atrStopLoss(optionLtp, atrVal);
 
     return {
       source: 'VWAP_BOUNCE' as StrategySource, side: 'BUY',
@@ -526,7 +541,7 @@ const bollingerBreakoutStrategy: StrategyPlugin = {
     if (confidence < env.strategyConfidenceThreshold) return null;
 
     const atrVal = atr(prices, 14);
-    const sl = atrStopLoss(optionLtp, atrVal, lastPrice);
+    const sl = atrStopLoss(optionLtp, atrVal);
 
     return {
       source: 'BOLLINGER_BREAKOUT' as StrategySource, side: 'BUY',
@@ -591,7 +606,7 @@ const stochasticMomentumStrategy: StrategyPlugin = {
     if (confidence < env.strategyConfidenceThreshold) return null;
 
     const atrVal = atr(prices, 14);
-    const sl = atrStopLoss(optionLtp, atrVal, lastPrice);
+    const sl = atrStopLoss(optionLtp, atrVal);
     const vwapVal = sessionVwap(ctx);
 
     return {
@@ -652,7 +667,7 @@ const smaPcrStrategy: StrategyPlugin = {
     const vwapVal = sessionVwap(ctx);
     const { macdLine, signalLine, histogram } = macd(prices);
     const atrVal = atr(prices, 14);
-    const sl = atrStopLoss(optionLtp, atrVal, lastPrice);
+    const sl = atrStopLoss(optionLtp, atrVal);
     const target = optionLtp * (1 + env.strategyProfitTargetPct / 100);
 
     return {

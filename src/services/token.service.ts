@@ -6,10 +6,29 @@ import { upstoxService } from './upstox.service';
 
 const PROVIDER = 'upstox';
 const TOKEN_REFRESH_BUFFER_MS = 60 * 1000;
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
 type TokenSource = 'database' | 'env' | 'none';
+type TokenSavedListener = () => void;
+
+/** Upstox access tokens expire at 03:30 IST the next morning, whatever time they were issued. */
+export const nextUpstoxExpiry = (from: Date = new Date()): Date => {
+  const ist = new Date(from.getTime() + IST_OFFSET_MS);
+  const expiryIst = new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate(), 3, 30, 0, 0));
+  if (expiryIst.getTime() <= ist.getTime()) {
+    expiryIst.setUTCDate(expiryIst.getUTCDate() + 1);
+  }
+  return new Date(expiryIst.getTime() - IST_OFFSET_MS);
+};
 
 class TokenService {
+  private readonly savedListeners: TokenSavedListener[] = [];
+
+  /** Called after every successful token save (OAuth login or notifier webhook). */
+  onTokenSaved(listener: TokenSavedListener): void {
+    this.savedListeners.push(listener);
+  }
+
   async exchangeAuthCode(code: string): Promise<void> {
     const tokenResponse = await upstoxService.exchangeCodeForToken(code);
     if (!tokenResponse.access_token) {
@@ -29,7 +48,7 @@ class TokenService {
       scope: tokenResponse.scope ?? null,
       expiresAt: expiresInSeconds
         ? new Date(Date.now() + expiresInSeconds * 1000)
-        : null,
+        : nextUpstoxExpiry(),
     });
   }
 
@@ -59,12 +78,13 @@ class TokenService {
       refreshToken: null,
       tokenType: payload.tokenType ?? 'Bearer',
       scope: payload.scope ?? null,
-      expiresAt: parsedExpiry,
+      expiresAt: parsedExpiry ?? nextUpstoxExpiry(),
     });
   }
 
   async getConnectionStatus(): Promise<{
     connected: boolean;
+    expired: boolean;
     expiresAt: string | null;
     tokenType: string | null;
     scope: string | null;
@@ -73,9 +93,12 @@ class TokenService {
     const token = await this.getToken();
 
     if (token) {
+      const expiresAt = this.effectiveExpiry(token);
+      const expired = expiresAt.getTime() <= Date.now() && !token.refreshToken;
       return {
-        connected: true,
-        expiresAt: token.expiresAt ? token.expiresAt.toISOString() : null,
+        connected: !expired,
+        expired,
+        expiresAt: expiresAt.toISOString(),
         tokenType: token.tokenType ?? null,
         scope: token.scope ?? null,
         source: 'database',
@@ -83,9 +106,12 @@ class TokenService {
     }
 
     if (env.upstoxAccessToken) {
+      const envExpiry = this.resolveEnvTokenExpiry();
+      const expired = envExpiry !== null && envExpiry.getTime() <= Date.now();
       return {
-        connected: true,
-        expiresAt: this.resolveEnvTokenExpiry()?.toISOString() ?? null,
+        connected: !expired,
+        expired,
+        expiresAt: envExpiry?.toISOString() ?? null,
         tokenType: 'Bearer',
         scope: null,
         source: 'env',
@@ -94,6 +120,7 @@ class TokenService {
 
     return {
       connected: false,
+      expired: false,
       expiresAt: null,
       tokenType: null,
       scope: null,
@@ -128,13 +155,18 @@ class TokenService {
       );
     }
 
-    const expiresAtMs = token.expiresAt?.getTime() ?? 0;
+    const expiresAtMs = this.effectiveExpiry(token).getTime();
     const shouldRefresh =
       Boolean(token.refreshToken) &&
-      expiresAtMs > 0 &&
       expiresAtMs - Date.now() < TOKEN_REFRESH_BUFFER_MS;
 
     if (!shouldRefresh) {
+      if (expiresAtMs <= Date.now()) {
+        throw new ApiError(
+          401,
+          `Upstox access token expired at ${new Date(expiresAtMs).toISOString()}. Approve the token request in the Upstox app / WhatsApp, or log in again.`,
+        );
+      }
       return token.accessToken;
     }
 
@@ -164,11 +196,20 @@ class TokenService {
       expiresAt: input.expiresAt,
     });
 
+    for (const listener of this.savedListeners) {
+      try { listener(); } catch { /* listeners must never break token saving */ }
+    }
+
     return token;
   }
 
   private async getToken(): Promise<OAuthToken | null> {
     return OAuthToken.findOne({ where: { provider: PROVIDER } });
+  }
+
+  /** Stored expiry, or — for older rows saved without one — the 03:30 IST after it was saved. */
+  private effectiveExpiry(token: OAuthToken): Date {
+    return token.expiresAt ?? nextUpstoxExpiry(token.updatedAt ?? new Date());
   }
 
   private resolveEnvTokenExpiry(): Date | null {

@@ -69,11 +69,26 @@ export const env = {
   upstoxRedirectUri: getString('UPSTOX_REDIRECT_URI', ''),
   upstoxAccessToken: getString('UPSTOX_ACCESS_TOKEN', ''),
   upstoxAccessTokenExpiresAt: getString('UPSTOX_ACCESS_TOKEN_EXPIRES_AT', ''),
+  // ── Daily token renewal (Upstox "Access Token Request" — approve in app/WhatsApp, no OTP) ──
+  // Requires the Notifier Webhook URL in the Upstox app to point at POST /api/auth/upstox/callback
+  upstoxAutoTokenRequest: getBoolean('UPSTOX_AUTO_TOKEN_REQUEST', true),
+  upstoxTokenRequestTimeIst: getString('UPSTOX_TOKEN_REQUEST_TIME_IST', '08:30'),
+  upstoxTokenRequestRetryMinutes: getNumber('UPSTOX_TOKEN_REQUEST_RETRY_MINUTES', 20),
+  upstoxTokenRequestMaxAttempts: getNumber('UPSTOX_TOKEN_REQUEST_MAX_ATTEMPTS', 3),
+  // Optional: your Upstox UCC. When set, webhook tokens for any other account are rejected.
+  upstoxUserId: getString('UPSTOX_USER_ID', ''),
+
+  // false = API only: no market polling, strategy loop, execution monitor or token requests.
+  // Use for a second (e.g. local) instance that points at a production database.
+  backgroundJobsEnabled: getBoolean('BACKGROUND_JOBS_ENABLED', true),
 
   niftyInstrumentKey: getString('NIFTY_INSTRUMENT_KEY', 'NSE_INDEX|Nifty 50'),
   optionChainInstrumentKey: getString('OPTION_CHAIN_INSTRUMENT_KEY', 'NSE_INDEX|Nifty 50'),
   optionChainExpiryDate: getString('OPTION_CHAIN_EXPIRY_DATE', ''),
   marketPollIntervalMs: getNumber('MARKET_POLL_INTERVAL_MS', 5000),
+  // Real-time ticks over the Upstox WebSocket (Upstox allows 2 connections per user; each backend uses 1).
+  // false = REST polling only (e.g. on an extra instance, to keep a connection free).
+  upstoxStreamEnabled: getBoolean('UPSTOX_STREAM_ENABLED', true),
   marketHistoryLimit: getNumber('MARKET_HISTORY_LIMIT', 500),
 
   strategyEnabled: getBoolean('STRATEGY_ENABLED', true),
@@ -86,6 +101,14 @@ export const env = {
   strategyTrailActivationPct: getNumber('STRATEGY_TRAIL_ACTIVATION_PCT', 8),
   strategyTrailOffsetPct: getNumber('STRATEGY_TRAIL_OFFSET_PCT', 3),
   strategyConfidenceThreshold: getNumber('STRATEGY_CONFIDENCE_THRESHOLD', 0.7),
+  // Rule-based scorer blocks SKIP / opposite-direction signals whenever no AI call will run
+  strategyRulesGateEnabled: getBoolean('STRATEGY_RULES_GATE_ENABLED', true),
+  // ATR stop loss on option premium: clamp(multiplier × ATM-delta × indexATR ÷ premium, min%, max%)
+  strategySlAtrMultiplier: getNumber('STRATEGY_SL_ATR_MULTIPLIER', 2.5),
+  strategySlMinPct: getNumber('STRATEGY_SL_MIN_PCT', 10),
+  strategySlMaxPct: getNumber('STRATEGY_SL_MAX_PCT', 30),
+  // How long a strategy intent waits for manual approval before it expires
+  intentExpiryMinutes: getNumber('INTENT_EXPIRY_MINUTES', 2),
 
   supportedUnderlyingsJson: getString('SUPPORTED_UNDERLYINGS_JSON', ''),
   defaultUnderlyingSymbol: getString('DEFAULT_UNDERLYING_SYMBOL', 'NIFTY'),
