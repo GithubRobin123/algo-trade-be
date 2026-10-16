@@ -286,10 +286,10 @@ class MarketDataService {
     const resolvedExpiryDate = expiryDate || (configuredExpiry && configuredExpiry >= today ? configuredExpiry : undefined);
     const cacheKey = `${underlying.optionChainInstrumentKey}:${resolvedExpiryDate ?? 'default'}`;
 
-    // Skip the Upstox API call if we fetched within the snapshot gap.
+    // Skip the Upstox API call if we fetched within OPTION_CHAIN_REFRESH_MS.
     // The spot price is polled separately every 5s, so strategy logic always has a fresh underlying price.
     const lastFetch = this.lastChainFetchAt.get(cacheKey) ?? 0;
-    if (Date.now() - lastFetch < MIN_CHAIN_SNAPSHOT_GAP_MS) {
+    if (Date.now() - lastFetch < env.optionChainRefreshMs) {
       const cached = this.lastChainData.get(cacheKey);
       if (cached) return cached;
     }

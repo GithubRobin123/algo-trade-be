@@ -85,6 +85,8 @@ export const env = {
   niftyInstrumentKey: getString('NIFTY_INSTRUMENT_KEY', 'NSE_INDEX|Nifty 50'),
   optionChainInstrumentKey: getString('OPTION_CHAIN_INSTRUMENT_KEY', 'NSE_INDEX|Nifty 50'),
   optionChainExpiryDate: getString('OPTION_CHAIN_EXPIRY_DATE', ''),
+  // How often the option chain is re-fetched from Upstox (DB snapshots are still rate-limited separately).
+  optionChainRefreshMs: getNumber('OPTION_CHAIN_REFRESH_MS', 30000),
   marketPollIntervalMs: getNumber('MARKET_POLL_INTERVAL_MS', 5000),
   // Real-time ticks over the Upstox WebSocket (Upstox allows 2 connections per user; each backend uses 1).
   // false = REST polling only (e.g. on an extra instance, to keep a connection free).

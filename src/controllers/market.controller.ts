@@ -3,6 +3,7 @@ import { ApiError } from '../middleware/error.middleware';
 import { marketDataService } from '../services/market-data.service';
 import { marketStreamService } from '../services/market-stream.service';
 import { underlyingService } from '../services/underlying.service';
+import { UnderlyingInstrument } from '../types/trading.types';
 
 const parseLimit = (value: unknown, fallback: number): number => {
   if (typeof value !== 'string') {
@@ -44,76 +45,87 @@ export const getStreamStatus = (_req: Request, res: Response): void => {
   res.json({ success: true, data: marketStreamService.getStatus() });
 };
 
-// Simple in-memory cache for overview — refreshed only during market hours
-let overviewCache: { data: unknown[]; cachedAt: number } | null = null;
+type OverviewRow = Pick<
+  UnderlyingInstrument,
+  'symbol' | 'displayName' | 'instrumentKey' | 'assetClass' | 'supportsOptions' | 'defaultLotSize'
+> & { ltp: number | null; prevClose: number | null; change: number | null; changePct: number | null };
 
-// Batch LTP for the market overview bar — all popular indices in one call
-export const getMarketOverview = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+// All indices come from ONE batched Upstox quote call, shared by every dashboard tab for
+// OVERVIEW_CACHE_MS. (One call per index on every 5s poll exceeded Upstox rate limits → 429 →
+// every price blank.) During market-closed hours the cache is served as-is.
+const OVERVIEW_CACHE_MS = 5_000;
+let overviewCache: { data: OverviewRow[]; cachedAt: number } | null = null;
+let overviewInFlight: Promise<OverviewRow[]> | null = null;
+let overviewErrorLoggedAt = 0;
+
+const buildMarketOverview = async (): Promise<OverviewRow[]> => {
+  const { tokenService } = await import('../services/token.service');
+  const { upstoxService } = await import('../services/upstox.service');
+
+  const accessToken = await tokenService.getValidAccessToken();
+  const allUnderlyings = underlyingService.list();
+
+  let quotes: Awaited<ReturnType<typeof upstoxService.getFullMarketQuote>> = {};
   try {
-    const { tokenService } = await import('../services/token.service');
-    const { upstoxService } = await import('../services/upstox.service');
-    const { underlyingService } = await import('../services/underlying.service');
+    quotes = await upstoxService.getFullMarketQuote(accessToken, allUnderlyings.map((u) => u.instrumentKey));
+  } catch (error) {
+    // Keep the last known prices below instead of blanking the bar (e.g. on an Upstox 429)
+    if (Date.now() - overviewErrorLoggedAt > 60_000) {
+      overviewErrorLoggedAt = Date.now();
+      process.stderr.write(`[Market] Overview quote fetch failed: ${String(error)}\n`);
+    }
+  }
+
+  const previous = new Map((overviewCache?.data ?? []).map((row) => [row.instrumentKey, row]));
+
+  return allUnderlyings.map((u) => {
+    const quote = quotes[u.instrumentKey];
+    const last = previous.get(u.instrumentKey);
+    const ltp = quote?.ltp ?? last?.ltp ?? null;
+    const change = quote ? quote.netChange : last?.change ?? null;
+    const prevClose = ltp !== null && change !== null ? ltp - change : null;
+    const changePct = change !== null && prevClose ? (change / prevClose) * 100 : null;
+    return {
+      symbol: u.symbol,
+      displayName: u.displayName,
+      instrumentKey: u.instrumentKey,
+      assetClass: u.assetClass,
+      supportsOptions: u.supportsOptions,
+      defaultLotSize: u.defaultLotSize,
+      ltp,
+      prevClose,
+      change,
+      changePct,
+    };
+  });
+};
+
+export const getMarketOverview = async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
     const { isMarketOpen } = await import('../services/market-data.service');
+    const marketOpen = isMarketOpen();
+    const isFresh = overviewCache && (!marketOpen || Date.now() - overviewCache.cachedAt < OVERVIEW_CACHE_MS);
 
-    // When market is closed, serve cached data (no Upstox API calls)
-    if (!isMarketOpen()) {
-      if (overviewCache) {
-        res.json({ success: true, data: overviewCache.data, marketOpen: false, cachedAt: new Date(overviewCache.cachedAt).toISOString() });
-        return;
+    if (!isFresh) {
+      if (!overviewInFlight) {
+        overviewInFlight = buildMarketOverview()
+          .then((data) => {
+            overviewCache = { data, cachedAt: Date.now() };
+            return data;
+          })
+          .finally(() => {
+            overviewInFlight = null;
+          });
       }
-      // No cache yet — fetch once and cache it
+      await overviewInFlight;
     }
 
-    const accessToken = await tokenService.getValidAccessToken();
-    const allUnderlyings = underlyingService.list();
-
-    // Fetch current LTP for all instruments in parallel
-    const ltpResults = await Promise.allSettled(
-      allUnderlyings.map((u) => upstoxService.getNiftyLtp(accessToken, u.instrumentKey)),
-    );
-
-    // Get today's first stored tick per instrument (used as day-open for change calc)
-    const { MarketTick } = await import('../models/market-tick.model');
-    const { Op } = await import('sequelize');
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-
-    const firstTicks = await MarketTick.findAll({
-      attributes: ['instrumentKey', 'ltp'],
-      where: { sourceTimestamp: { [Op.gte]: todayStart } } as never,
-      order: [['sourceTimestamp', 'ASC']],
+    res.json({
+      success: true,
+      data: overviewCache?.data ?? [],
+      marketOpen,
+      cachedAt: overviewCache ? new Date(overviewCache.cachedAt).toISOString() : null,
     });
-    const dayOpenMap: Record<string, number> = {};
-    for (const tick of firstTicks) {
-      if (!(tick.instrumentKey in dayOpenMap)) {
-        dayOpenMap[tick.instrumentKey] = Number(tick.ltp);
-      }
-    }
-
-    const overview = allUnderlyings.map((u, idx) => {
-      const ltpResult = ltpResults[idx];
-      const ltp = ltpResult.status === 'fulfilled' ? ltpResult.value.ltp : null;
-      const dayOpen = dayOpenMap[u.instrumentKey] ?? null;
-      const change = ltp != null && dayOpen != null && dayOpen > 0 ? ltp - dayOpen : null;
-      const changePct = change != null && dayOpen != null && dayOpen > 0 ? (change / dayOpen) * 100 : null;
-      return {
-        symbol: u.symbol,
-        displayName: u.displayName,
-        instrumentKey: u.instrumentKey,
-        assetClass: u.assetClass,
-        supportsOptions: u.supportsOptions,
-        defaultLotSize: u.defaultLotSize,
-        ltp,
-        prevClose: dayOpen,
-        change,
-        changePct,
-      };
-    });
-
-    // Cache the result
-    overviewCache = { data: overview, cachedAt: Date.now() };
-
-    res.json({ success: true, data: overview, marketOpen: isMarketOpen() });
   } catch (error) {
     next(error);
   }
@@ -214,6 +226,7 @@ export const getOptionChain = async (req: Request, res: Response, next: NextFunc
       return;
     }
 
+    process.stderr.write(`[Market] Option chain request failed: ${String(error)}\n`);
     next(new ApiError(500, 'Failed to fetch option chain'));
   }
 };

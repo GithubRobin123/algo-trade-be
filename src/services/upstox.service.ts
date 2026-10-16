@@ -230,10 +230,15 @@ export class UpstoxService {
     }
   }
 
+  /**
+   * Full quotes for many instruments in ONE call, keyed by instrument key (`NSE_INDEX|Nifty 50`).
+   * Upstox keys its response as `NSE_INDEX:Nifty 50`, so each quote is mapped back via its
+   * `instrument_token` (and the `:`→`|` form as a fallback).
+   */
   async getFullMarketQuote(
     accessToken: string,
     instrumentKeys: string[],
-  ): Promise<Record<string, { ltp: number | null; close: number | null; raw: Record<string, unknown> }>> {
+  ): Promise<Record<string, { ltp: number | null; close: number | null; netChange: number | null; raw: Record<string, unknown> }>> {
     const keys = instrumentKeys.filter((item) => item.trim() !== '');
 
     if (!keys.length) {
@@ -249,17 +254,21 @@ export class UpstoxService {
       });
 
       const root = asRecord(data.data ?? data);
-      const response: Record<string, { ltp: number | null; close: number | null; raw: Record<string, unknown> }> = {};
+      const response: Record<string, { ltp: number | null; close: number | null; netChange: number | null; raw: Record<string, unknown> }> = {};
 
-      for (const [instrumentKey, payload] of Object.entries(root)) {
+      for (const [responseKey, payload] of Object.entries(root)) {
         const quote = asRecord(payload);
         const ohlc = asRecord(quote.ohlc);
-
-        response[instrumentKey] = {
+        const entry = {
           ltp: toNumber(quote.last_price) ?? toNumber(quote.ltp),
           close: toNumber(ohlc.close),
+          netChange: toNumber(quote.net_change),
           raw: quote,
         };
+
+        const token = toText(quote.instrument_token ?? quote.instrumentToken);
+        response[token ?? responseKey.replace(':', '|')] = entry;
+        response[responseKey] = entry;
       }
 
       return response;

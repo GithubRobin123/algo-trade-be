@@ -116,6 +116,29 @@ class DbManager {
 
   async sync(): Promise<void> {
     await this.active.sync();
+    await this.resyncSequences(this.active);
+  }
+
+  /**
+   * Mirror writes copy rows to the standby with explicit ids, which never advances the standby's
+   * id sequences. After a failover/failback the new active DB would hand out ids that already
+   * exist (unique-constraint errors on every insert), so move each sequence up to max(id).
+   * Never moves a sequence backwards.
+   */
+  private async resyncSequences(conn: Sequelize): Promise<void> {
+    for (const model of MIRRORED_MODELS) {
+      const tableName = model.getTableName() as string;
+      try {
+        await conn.query(
+          `SELECT setval(seq::regclass, GREATEST((SELECT MAX(id) FROM "${tableName}"), COALESCE(pg_sequence_last_value(seq::regclass), 0)), true)
+           FROM pg_get_serial_sequence('"${tableName}"', 'id') AS seq
+           WHERE seq IS NOT NULL AND EXISTS (SELECT 1 FROM "${tableName}")`,
+          { type: QueryTypes.SELECT },
+        );
+      } catch (err) {
+        process.stderr.write(`[DB] Sequence resync failed for ${tableName}: ${String(err)}\n`);
+      }
+    }
   }
 
   async close(): Promise<void> {
@@ -185,6 +208,7 @@ class DbManager {
     this.consecutivePrimaryRecoveries = 0;
     initModels(this.active);
     this.attachMirrorHooks();
+    await this.resyncSequences(this.active);
   }
 
   private async failback(): Promise<void> {
@@ -196,6 +220,7 @@ class DbManager {
     this.consecutivePrimaryRecoveries = 0;
     initModels(this.active);
     this.attachMirrorHooks();
+    await this.resyncSequences(this.active);
   }
 
   /**
