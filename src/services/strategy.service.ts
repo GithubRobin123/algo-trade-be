@@ -28,15 +28,11 @@ import { StrategyPosition } from '../models/strategy-position.model';
 import { PositionPnlTick } from '../models/position-pnl-tick.model';
 import { TradeIntent } from '../models/trade-intent.model';
 import { StrategyRiskSnapshot, StrategySignal } from '../types/trading.types';
-import {
-  AiDecisionParams,
-  AiDecisionResult,
-  computeRuleBasedDecision,
-  getAiTradeDecision,
-} from './ai-decision.service';
+import { AiDecisionResult, getAiTradeDecision, selectByRules } from './ai-decision.service';
 import { executionService } from './execution.service';
+import { historicalCandleService } from './historical-candle.service';
 import { isMarketOpen, marketDataService, getLatestVix } from './market-data.service';
-import { StrategyContext, strategyRegistry, atr, supertrend, adx, bollingerBands, stochastic } from './strategy-registry.service';
+import { StrategyContext, strategyRegistry } from './strategy-registry.service';
 import { tokenService } from './token.service';
 import { tradeEventService } from './trade-event.service';
 import { tradeIntentService } from './trade-intent.service';
@@ -73,6 +69,28 @@ function isInCooldown(sym: string): boolean {
 function recordSignal(sym: string): void {
   lastSignalTime.set(sym, Date.now());
 }
+
+// Minimum warm-up + session candles before any strategy runs (the longest plugin needs 40)
+const MIN_STRATEGY_CANDLES = 40;
+
+/** Version + the parameters that shape entries/exits, stamped on every decision and trade. */
+const strategyStamp = (): { strategyVersion: string; strategyParams: Record<string, number | boolean> } => ({
+  strategyVersion: env.strategyVersion,
+  strategyParams: {
+    confidenceThreshold: env.strategyConfidenceThreshold,
+    rulesGate: env.strategyRulesGateEnabled,
+    minRuleProbabilityPct: env.aiMinProbabilityPct,
+    slAtrMultiplier: env.strategySlAtrMultiplier,
+    slMinPct: env.strategySlMinPct,
+    slMaxPct: env.strategySlMaxPct,
+    profitTargetPct: env.strategyProfitTargetPct,
+    trailActivationPct: env.strategyTrailActivationPct,
+    trailOffsetPct: env.strategyTrailOffsetPct,
+    trailAtrMultiplier: env.strategyTrailAtrMultiplier,
+    cooldownMinutes: SIGNAL_COOLDOWN_MS / 60000,
+    maxTradesPerDay: env.strategyMaxAutoTradesPerDay,
+  },
+});
 
 // ── PCR from ±10 strikes around ATM ──────────────────────────────────────
 function computePcr(chainRows: { strikePrice: number; callOi: number | null; putOi: number | null }[], atmStrike: number): number {
@@ -126,7 +144,7 @@ async function logDecision(input: DecisionLogInput): Promise<void> {
       confidence: input.confidence ?? null,
       signalSource: input.signalSource ?? null,
       rationale: input.rationale ?? null,
-      signalMetadata: input.signalMetadata ?? {},
+      signalMetadata: { ...(input.signalMetadata ?? {}), strategyVersion: env.strategyVersion },
       latencyMs: input.latencyMs ?? null,
       aiProvider: input.aiProvider ?? null,
       aiLatencyMs: input.aiLatencyMs ?? null,
@@ -237,18 +255,18 @@ class StrategyService {
         latestIndexPrice = fetched?.ltp ?? null;
       }
 
-      // Primary: 5-min candles (session-only; a full session is 75 candles)
-      const candles = await marketDataService.getCandleHistory(100, underlying.instrumentKey);
-      // Fallback: session-only ticks
+      // 5-min candles: previous-session warm-up + today (completed only). No tick fallback.
+      const series = await historicalCandleService.getSeries(underlying.instrumentKey);
+      const { candles, sessionCandles } = series;
       const history = await marketDataService.getSessionTickHistory(100, underlying.instrumentKey);
 
-      if (candles.length < 5 && history.length < 20) {
-        await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'NO_SIGNAL', rejectionReason: `Insufficient data: ${candles.length} candles, ${history.length} ticks (need 5 candles or 20 ticks)`, latencyMs: Date.now() - cycleStart });
+      if (candles.length < MIN_STRATEGY_CANDLES) {
+        await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'NO_SIGNAL', rejectionReason: `Insufficient data: ${candles.length} candles (need ${MIN_STRATEGY_CANDLES}, source ${series.source})`, latencyMs: Date.now() - cycleStart });
         return { signal: null, intentId: null, logId: null, decisionSource: 'no-history', strategyName: null };
       }
 
       const prices = history.map((t) => t.ltp);
-      const lastPrice = latestIndexPrice ?? (candles.length > 0 ? Number(candles[candles.length - 1].close) : prices[prices.length - 1]);
+      const lastPrice = latestIndexPrice ?? candles[candles.length - 1].close;
 
       // Option chain
       const chain = await marketDataService.fetchAndStoreOptionChain(undefined, underlying.symbol).catch(() => null);
@@ -278,17 +296,10 @@ class StrategyService {
       const atmPutOi = atmRow.putOi ?? 0;
       const atmIv = atmRow.iv;
 
-      // dayHigh, dayLow, prevDayClose: from latest candle (filled from Upstox OHLC)
-      const latestCandle = candles.length > 0 ? candles[candles.length - 1] : null;
-      const dayHigh = latestCandle?.dayHigh !== null && latestCandle?.dayHigh !== undefined
-        ? Number(latestCandle.dayHigh)
-        : prices.length > 0 ? Math.max(...prices) : lastPrice;
-      const dayLow = latestCandle?.dayLow !== null && latestCandle?.dayLow !== undefined
-        ? Number(latestCandle.dayLow)
-        : prices.length > 0 ? Math.min(...prices) : lastPrice;
-      const prevDayClose = latestCandle?.prevClose !== null && latestCandle?.prevClose !== undefined
-        ? Number(latestCandle.prevClose)
-        : lastPrice; // fallback to current if no candle data yet
+      // Day high/low from today's candles + live price; previous close from the last warm-up candle
+      const dayHigh = Math.max(lastPrice, ...sessionCandles.map((c) => c.high));
+      const dayLow = Math.min(lastPrice, ...sessionCandles.map((c) => c.low));
+      const prevDayClose = series.prevSessionClose ?? lastPrice;
 
       const vix = getLatestVix();
       // Exchange lot size for this expiry (lot sizes are revised by NSE/BSE); config value is the fallback
@@ -298,6 +309,8 @@ class StrategyService {
         underlying: sym,
         prices,
         candles,
+        sessionCandles,
+        diagnostics: {},
         lastPrice,
         pcr,
         atmStrike: atmRow.strikePrice,
@@ -325,79 +338,40 @@ class StrategyService {
     }
 
     // 6. Run strategy registry
-    const registryResult = strategyRegistry.runAll(strategyContext);
-    if (!registryResult) {
-      await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'NO_SIGNAL', rejectionReason: 'No strategy produced a signal', latencyMs: Date.now() - cycleStart });
+    const candidates = strategyRegistry.evaluateAll(strategyContext);
+    if (!candidates.length) {
+      await logDecision({
+        underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'NO_SIGNAL',
+        rejectionReason: 'No strategy produced a signal',
+        signalMetadata: { strategyDiagnostics: strategyContext.diagnostics, candles: strategyContext.candles.length, sessionCandles: strategyContext.sessionCandles.length },
+        latencyMs: Date.now() - cycleStart,
+      });
       return { signal: null, intentId: null, logId: null, decisionSource: 'no-signal', strategyName: null };
     }
 
-    const { signal, strategyName } = registryResult;
+    // 7. Rule-based probability check — the rule scorer is the gate whenever the AI does not
+    // decide (AI off, provider 'none', no API key, or the AI call failed). It blocks SKIP and
+    // opposite-direction verdicts; the first candidate it agrees with is taken.
+    const aiWillRun = env.aiEnabled && env.aiProvider !== 'none' && Boolean(env.aiApiKey);
+    const { chosen, verdicts } = selectByRules(strategyContext, candidates, latestIndexPrice, !aiWillRun && env.strategyRulesGateEnabled);
+    const { signal, strategyName } = chosen.candidate;
+    const { ruleParams, ruleResult, blockReason: rulesBlockReason } = chosen;
+    const candidateVerdicts = verdicts.map((v) => ({
+      strategy: v.candidate.strategyName,
+      side: v.ruleParams.optionType,
+      confidence: Number(v.candidate.signal.confidence.toFixed(3)),
+      verdict: v.blockReason ?? 'PASS',
+    }));
 
-    // 7. Rule-based probability check
     const meta = signal.metadata as Record<string, unknown>;
     const optionType: 'CALL' | 'PUT' = (meta.bullish as boolean) ? 'CALL' : 'PUT';
 
-    const candlePrices = strategyContext.candles.length >= 5
-      ? strategyContext.candles.map((c) => Number(c.close))
-      : strategyContext.prices;
-
-    const atr14 = (meta.atr as number) ?? atr(candlePrices, 14);
-    const stDir = (meta.supertrendDirection as 'BULLISH' | 'BEARISH' | null | undefined) ?? supertrend(candlePrices, 10, 3, sym);
-    const { adx: adx14 } = adx(candlePrices, 14);
-    const bb = bollingerBands(candlePrices, 20, 2);
-    const stoch = stochastic(candlePrices, 14, 3);
-
-    const ruleParams: AiDecisionParams = {
-      index: sym,
-      currentPrice: latestIndexPrice ?? 0,
-      atmStrike: (meta.strike as number) ?? 0,
-      optionType,
-      optionPremium: signal.entryPrice,
-      rsi14: (meta.rsi14 as number) ?? 50,
-      ema9: (meta.ema9 as number) ?? 0,
-      ema21: (meta.ema21 as number) ?? 0,
-      macd: (meta.macd as number) ?? 0,
-      macdSignal: (meta.macdSignal as number) ?? 0,
-      macdHistogram: (meta.macdHistogram as number) ?? 0,
-      vwap: (meta.vwap as number) ?? (latestIndexPrice ?? 0),
-      volumeRatio: (meta.volumeRatio as number) ?? 1,
-      dayHigh: strategyContext.dayHigh,
-      dayLow: strategyContext.dayLow,
-      prevDayClose: strategyContext.prevDayClose,
-      // Real OI values from chain
-      atmCallOI: strategyContext.atmCallOi,
-      atmPutOI: strategyContext.atmPutOi,
-      pcrRatio: strategyContext.pcr,
-      ivPercentile: strategyContext.atmIv ?? 40,
-      indiaVix: strategyContext.vix,
-      timeIST,
-      minutesToClose,
-      atr14,
-      adx14,
-      supertrendDirection: stDir,
-      bbPercentB: bb.percentB,
-      bbBandwidth: bb.bandwidth,
-      stochK: stoch.k,
-      stochD: stoch.d,
-    };
-
-    const ruleResult = computeRuleBasedDecision(ruleParams);
-
-    // The rule scorer is the gate whenever the AI does not decide: AI off, provider 'none',
-    // no API key, or the AI call failed. It blocks SKIP and opposite-direction verdicts.
-    const strategySide = optionType === 'CALL' ? 'BUY_CALL' : 'BUY_PUT';
-    const rulesBlockReason = ruleResult.action === 'SKIP'
-      ? 'Rules SKIP'
-      : ruleResult.action !== strategySide
-        ? `Rules favour ${ruleResult.action} but strategy wants ${strategySide}`
-        : null;
     const rejectByRules = async (source: string) => {
-      await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'LOW_CONFIDENCE', rejectionReason: `${rulesBlockReason}. Bull=${ruleResult.rawBullScore} Bear=${ruleResult.rawBearScore}`, confidence: signal.confidence, signalSource: signal.source, rationale: signal.rationale, signalMetadata: { ...signal.metadata, ruleSignals: ruleResult.signals, strategyName }, latencyMs: Date.now() - cycleStart });
+      await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'LOW_CONFIDENCE', rejectionReason: `${rulesBlockReason}. Bull=${ruleResult.rawBullScore} Bear=${ruleResult.rawBearScore}`, confidence: signal.confidence, signalSource: signal.source, rationale: signal.rationale, signalMetadata: { ...signal.metadata, ruleSignals: ruleResult.signals, strategyName, candidateVerdicts }, latencyMs: Date.now() - cycleStart });
       await tradeEventService.emit({ type: 'SIGNAL_REJECTED', underlying: sym, reason: `Rule-based: ${rulesBlockReason}`, strategy: strategyName, metadata: { ruleSignals: ruleResult.signals } });
       return { signal, intentId: null, logId: null, decisionSource: source, strategyName };
     };
 
-    const aiWillRun = env.aiEnabled && env.aiProvider !== 'none' && Boolean(env.aiApiKey);
     if (!aiWillRun && env.strategyRulesGateEnabled && rulesBlockReason) {
       return rejectByRules('rules-skip');
     }
@@ -465,6 +439,7 @@ class StrategyService {
           stopLossPrice: signal.suggestedStopLoss, targetPrice: signal.suggestedTarget,
           trailActivationPct: env.strategyTrailActivationPct, trailOffsetPct: env.strategyTrailOffsetPct,
           strategyDate: sameDayIso(), decisionSource, strategyName, ruleSignals: ruleResult.signals,
+          ...strategyStamp(),
         },
       });
 
@@ -479,7 +454,7 @@ class StrategyService {
         entryPremium: signal.entryPrice, stopLossPrice: signal.suggestedStopLoss,
         targetPrice: signal.suggestedTarget, confidence: finalConfidence,
         signalSource: signal.source, rationale: signal.rationale,
-        signalMetadata: { ...signal.metadata, ruleSignals: ruleResult.signals, decisionSource, strategyName },
+        signalMetadata: { ...signal.metadata, ruleSignals: ruleResult.signals, decisionSource, strategyName, ...strategyStamp() },
         latencyMs: Date.now() - cycleStart, aiProvider, aiLatencyMs, tradeOfDay,
       });
 

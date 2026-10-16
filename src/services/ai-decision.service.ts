@@ -10,7 +10,19 @@
  */
 
 import { env } from '../config/env';
-import { atrStopLossPct } from './strategy-registry.service';
+import { StrategySignal } from '../types/trading.types';
+import {
+  StrategyContext,
+  adx,
+  atr,
+  atrStopLossPct,
+  bollingerBands,
+  ema,
+  macd,
+  rsi,
+  stochastic,
+  supertrend,
+} from './strategy-registry.service';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -428,13 +440,121 @@ export interface RuleBasedResult {
   rawBearScore: number;
 }
 
+/**
+ * Rule-scorer inputs for a strategy signal: the plugin's own metadata, with any indicator it did
+ * not report computed from the same 5-min candles (a missing ema21 used to default to 0, which
+ * always scored "EMA9 > EMA21" as bullish). Shared by the live pipeline and the offline backtest.
+ */
+export function buildRuleParams(
+  ctx: StrategyContext,
+  signal: StrategySignal,
+  indexPrice: number | null,
+): AiDecisionParams {
+  const meta = signal.metadata as Record<string, unknown>;
+  const closes = ctx.candles.map((c) => c.close);
+  const macdVals = meta.macd === undefined ? macd(closes) : null;
+  const bb = bollingerBands(closes, 20, 2);
+  const stoch = stochastic(closes, 14, 3);
+
+  return {
+    index: ctx.underlying,
+    currentPrice: indexPrice ?? 0,
+    atmStrike: (meta.strike as number) ?? 0,
+    optionType: (meta.bullish as boolean) ? 'CALL' : 'PUT',
+    optionPremium: signal.entryPrice,
+    rsi14: (meta.rsi14 as number) ?? rsi(closes, 14),
+    ema9: (meta.ema9 as number) ?? ema(closes, 9),
+    ema21: (meta.ema21 as number) ?? ema(closes, 21),
+    macd: (meta.macd as number) ?? macdVals?.macdLine ?? 0,
+    macdSignal: (meta.macdSignal as number) ?? macdVals?.signalLine ?? 0,
+    macdHistogram: (meta.macdHistogram as number) ?? macdVals?.histogram ?? 0,
+    vwap: (meta.vwap as number) ?? (indexPrice ?? 0),
+    volumeRatio: (meta.volumeRatio as number) ?? 1,
+    dayHigh: ctx.dayHigh,
+    dayLow: ctx.dayLow,
+    prevDayClose: ctx.prevDayClose,
+    atmCallOI: ctx.atmCallOi,
+    atmPutOI: ctx.atmPutOi,
+    pcrRatio: ctx.pcr,
+    ivPercentile: ctx.atmIv ?? 40,
+    indiaVix: ctx.vix,
+    timeIST: ctx.timeIST,
+    minutesToClose: ctx.minutesToClose,
+    atr14: (meta.atr as number) ?? atr(closes, 14),
+    adx14: adx(closes, 14).adx,
+    supertrendDirection: (meta.supertrendDirection as 'BULLISH' | 'BEARISH' | null | undefined) ?? supertrend(ctx.candles, 10, 3),
+    bbPercentB: bb.percentB,
+    bbBandwidth: bb.bandwidth,
+    stochK: stoch.k,
+    stochD: stoch.d,
+  };
+}
+
+export interface RuleVerdict<T> {
+  candidate: T;
+  ruleParams: AiDecisionParams;
+  ruleResult: RuleBasedResult;
+  /** Why the rule scorer blocks this signal (SKIP or opposite direction), or null if it agrees. */
+  blockReason: string | null;
+}
+
+/**
+ * Scores every candidate signal (highest confidence first) and picks the one to act on: when the
+ * rule scorer is the gate, the first candidate it agrees with; otherwise the top candidate.
+ * Previously only the top candidate was scored, so a counter-trend signal with slightly higher
+ * confidence (e.g. a Bollinger upper-band PUT) that the gate rejected hid a valid trend signal.
+ */
+export function selectByRules<T extends { signal: StrategySignal }>(
+  ctx: StrategyContext,
+  candidates: T[],
+  indexPrice: number | null,
+  rulesGateDecides: boolean,
+): { chosen: RuleVerdict<T>; verdicts: RuleVerdict<T>[] } {
+  const verdicts = candidates.map((candidate) => {
+    const ruleParams = buildRuleParams(ctx, candidate.signal, indexPrice);
+    const ruleResult = computeRuleBasedDecision(ruleParams);
+    const side = ruleParams.optionType === 'CALL' ? 'BUY_CALL' : 'BUY_PUT';
+    const blockReason = ruleResult.action === 'SKIP'
+      ? 'Rules SKIP'
+      : ruleResult.action !== side
+        ? `Rules favour ${ruleResult.action} but strategy wants ${side}`
+        : null;
+    return { candidate, ruleParams, ruleResult, blockReason };
+  });
+  const chosen = (rulesGateDecides ? verdicts.find((v) => !v.blockReason) : undefined) ?? verdicts[0];
+  return { chosen, verdicts };
+}
+
 export function computeRuleBasedDecision(params: AiDecisionParams): RuleBasedResult {
   let bullScore = 0;
   let bearScore = 0;
   const signals: string[] = [];
 
+  // A strong, aligned trend (ADX ≥ 25 with Supertrend, EMA9/21 and VWAP agreeing) runs at high RSI
+  // and hugs the outer Bollinger band for long stretches. Scoring that as overbought/oversold made
+  // the gate SKIP every trend-continuation entry, so in that regime it counts as momentum instead.
+  const strongTrend = (params.adx14 ?? 0) >= 25;
+  const strongUptrend = strongTrend && params.supertrendDirection === 'BULLISH'
+    && params.ema9 > params.ema21 && params.currentPrice > params.vwap;
+  const strongDowntrend = strongTrend && params.supertrendDirection === 'BEARISH'
+    && params.ema9 < params.ema21 && params.currentPrice < params.vwap;
+
   // ── RSI ─────────────────────────────────────────────────────────────
-  if (params.rsi14 < 35) {
+  if (strongUptrend && params.rsi14 > 55) {
+    if (params.rsi14 <= 80) {
+      bullScore += 10;
+      signals.push(`RSI ${params.rsi14.toFixed(0)} — momentum in strong uptrend`);
+    } else {
+      signals.push(`RSI ${params.rsi14.toFixed(0)} — stretched in uptrend, not scored`);
+    }
+  } else if (strongDowntrend && params.rsi14 < 45) {
+    if (params.rsi14 >= 20) {
+      bearScore += 10;
+      signals.push(`RSI ${params.rsi14.toFixed(0)} — momentum in strong downtrend`);
+    } else {
+      signals.push(`RSI ${params.rsi14.toFixed(0)} — stretched in downtrend, not scored`);
+    }
+  } else if (params.rsi14 < 35) {
     bullScore += 25;
     signals.push(`RSI oversold (${params.rsi14.toFixed(0)})`);
   } else if (params.rsi14 < 45) {
@@ -537,11 +657,19 @@ export function computeRuleBasedDecision(params: AiDecisionParams): RuleBasedRes
   // ── Bollinger Band position ──────────────────────────────────────────
   if (params.bbPercentB != null) {
     if (params.bbPercentB <= 0.05) {
-      bullScore += 15;
-      signals.push(`BB %B=${(params.bbPercentB * 100).toFixed(0)}% — price at lower band (oversold)`);
+      if (strongDowntrend) {
+        signals.push(`BB %B=${(params.bbPercentB * 100).toFixed(0)}% — riding lower band in downtrend, not scored`);
+      } else {
+        bullScore += 15;
+        signals.push(`BB %B=${(params.bbPercentB * 100).toFixed(0)}% — price at lower band (oversold)`);
+      }
     } else if (params.bbPercentB >= 0.95) {
-      bearScore += 15;
-      signals.push(`BB %B=${(params.bbPercentB * 100).toFixed(0)}% — price at upper band (overbought)`);
+      if (strongUptrend) {
+        signals.push(`BB %B=${(params.bbPercentB * 100).toFixed(0)}% — riding upper band in uptrend, not scored`);
+      } else {
+        bearScore += 15;
+        signals.push(`BB %B=${(params.bbPercentB * 100).toFixed(0)}% — price at upper band (overbought)`);
+      }
     }
     // BB squeeze: upcoming breakout — don't add directional score but flag it
     if (params.bbBandwidth != null && params.bbBandwidth < 0.8) {

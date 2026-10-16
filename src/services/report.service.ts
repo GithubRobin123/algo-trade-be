@@ -31,7 +31,66 @@ export interface DailyReportRow {
   realizedPnl: number;
 }
 
+export interface PerformanceStats {
+  trades: number;
+  wins: number;
+  losses: number;
+  winRatePct: number;
+  grossPnl: number;
+  estimatedCharges: number;
+  netPnl: number;
+  avgWin: number;
+  avgLoss: number;
+  profitFactor: number | null;
+  expectancyPerTrade: number;
+  exitReasons: Record<string, number>;
+}
+
+export interface VersionPerformance extends PerformanceStats {
+  version: string;
+  firstTradeAt: string | null;
+  lastTradeAt: string | null;
+  byStrategy: Record<string, PerformanceStats>;
+}
+
+// Rough all-in cost of one options round trip (2 × ₹20 brokerage + STT, exchange, GST, stamp)
+const EST_CHARGES_PER_ROUND_TRIP = 60;
+
 const formatDay = (date: Date): string => date.toISOString().slice(0, 10);
+
+const round2 = (value: number): number => Math.round(value * 100) / 100;
+
+const computeStats = (positions: StrategyPosition[]): PerformanceStats => {
+  const pnls = positions.map((p) => Number(p.realizedPnl ?? 0));
+  const winners = pnls.filter((v) => v > 0);
+  const losers = pnls.filter((v) => v <= 0);
+  const grossWin = winners.reduce((s, v) => s + v, 0);
+  const grossLoss = Math.abs(losers.reduce((s, v) => s + v, 0));
+  const grossPnl = grossWin - grossLoss;
+  const estimatedCharges = positions.length * EST_CHARGES_PER_ROUND_TRIP;
+
+  const exitReasons: Record<string, number> = {};
+  for (const p of positions) {
+    // "TECH_REVERSAL: RSI exhaustion 97 …" → "TECH_REVERSAL"
+    const reason = (p.exitReason ?? 'UNKNOWN').split(':')[0].trim() || 'UNKNOWN';
+    exitReasons[reason] = (exitReasons[reason] ?? 0) + 1;
+  }
+
+  return {
+    trades: positions.length,
+    wins: winners.length,
+    losses: losers.length,
+    winRatePct: positions.length ? round2((winners.length / positions.length) * 100) : 0,
+    grossPnl: round2(grossPnl),
+    estimatedCharges,
+    netPnl: round2(grossPnl - estimatedCharges),
+    avgWin: winners.length ? round2(grossWin / winners.length) : 0,
+    avgLoss: losers.length ? round2(-grossLoss / losers.length) : 0,
+    profitFactor: grossLoss > 0 ? round2(grossWin / grossLoss) : null,
+    expectancyPerTrade: positions.length ? round2((grossPnl - estimatedCharges) / positions.length) : 0,
+    exitReasons,
+  };
+};
 
 class ReportService {
   async getSummary(days = 30): Promise<ReportSummary> {
@@ -194,6 +253,47 @@ class ReportService {
     }
 
     return Array.from(map.values());
+  }
+
+  /**
+   * Closed strategy trades grouped by strategy version (positions opened before versioning
+   * count as "v1"), then by strategy within each version — so a change can be judged on its
+   * own trades instead of being mixed into the overall numbers.
+   */
+  async getStrategyPerformance(days = 90): Promise<VersionPerformance[]> {
+    const safeDays = Math.min(Math.max(days, 1), 365);
+    const start = new Date(Date.now() - safeDays * 24 * 60 * 60 * 1000);
+
+    const positions = await StrategyPosition.findAll({
+      where: {
+        status: 'CLOSED',
+        [Op.and]: [sqlWhere(col('created_at'), Op.gte, start)],
+      },
+      order: [['createdAt', 'ASC']],
+    });
+
+    const meta = (p: StrategyPosition): Record<string, unknown> => (p.metadata ?? {}) as Record<string, unknown>;
+    const byVersion = new Map<string, StrategyPosition[]>();
+    for (const p of positions) {
+      const version = typeof meta(p).strategyVersion === 'string' ? String(meta(p).strategyVersion) : 'v1';
+      byVersion.set(version, [...(byVersion.get(version) ?? []), p]);
+    }
+
+    return [...byVersion.entries()].map(([version, list]) => {
+      const byStrategyLists = new Map<string, StrategyPosition[]>();
+      for (const p of list) {
+        const name = typeof meta(p).strategyName === 'string' ? String(meta(p).strategyName) : 'UNKNOWN';
+        byStrategyLists.set(name, [...(byStrategyLists.get(name) ?? []), p]);
+      }
+
+      return {
+        version,
+        firstTradeAt: list[0]?.createdAt.toISOString() ?? null,
+        lastTradeAt: list[list.length - 1]?.createdAt.toISOString() ?? null,
+        ...computeStats(list),
+        byStrategy: Object.fromEntries([...byStrategyLists.entries()].map(([name, items]) => [name, computeStats(items)])),
+      };
+    });
   }
 }
 

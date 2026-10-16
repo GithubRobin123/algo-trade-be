@@ -29,7 +29,8 @@ import { marketDataService } from './market-data.service';
 import { websocketService } from './websocket.service';
 import { underlyingService } from './underlying.service';
 import { marketStreamService } from './market-stream.service';
-import { ema, rsi, macd, supertrend } from './strategy-registry.service';
+import { ATM_DELTA, adx, ema, rsi, macd, supertrend } from './strategy-registry.service';
+import { StrategyCandle, historicalCandleService } from './historical-candle.service';
 
 // ── EOD square-off time: 3:10 PM IST (5 min before market close) ──────────
 const EOD_SQUAREOFF_HOUR = 15;
@@ -569,12 +570,19 @@ class ExecutionService {
       trailStarted = !position.trailActive;
       position.trailActive = true;
 
+      // Trail distance in premium points: the larger of TRAIL_OFFSET_PCT of the best price and
+      // the entry's index ATR converted to premium. A flat 6% sat inside normal 5-minute noise,
+      // so trend winners were stopped out at +9–17% (no trade ever reached the target).
+      const entryAtr = Number((position.metadata as Record<string, unknown> | null)?.atr ?? 0);
+      const atrDistance = Number.isFinite(entryAtr) && entryAtr > 0 ? entryAtr * ATM_DELTA * env.strategyTrailAtrMultiplier : 0;
+      const trailDistance = Math.max(newBestPrice * (env.strategyTrailOffsetPct / 100), atrDistance);
+
       if (position.side === 'BUY') {
-        const trailFromBest = newBestPrice * (1 - env.strategyTrailOffsetPct / 100);
+        const trailFromBest = newBestPrice - trailDistance;
         const lockProfit = entryPrice * 1.01;
         newSl = Math.max(Number(position.stopLossPrice), trailFromBest, lockProfit);
       } else {
-        const trailFromBest = newBestPrice * (1 + env.strategyTrailOffsetPct / 100);
+        const trailFromBest = newBestPrice + trailDistance;
         const lockProfit = entryPrice * 0.99;
         newSl = Math.min(Number(position.stopLossPrice), trailFromBest, lockProfit);
       }
@@ -715,6 +723,7 @@ class ExecutionService {
     if (!position.trailActive) return { shouldExit: false, reason: '' };
 
     const underlying = position.symbol.split('-')[0] ?? position.symbol;
+    let candles: StrategyCandle[];
     let prices: number[];
 
     try {
@@ -724,23 +733,20 @@ class ExecutionService {
         ? meta.underlyingInstrumentKey
         : underlyingService.resolve(underlying).instrumentKey;
 
-      const candles = await marketDataService.getCandleHistory(100, underlyingKey);
-      if (candles.length >= 25) {
-        prices = candles.map((c) => Number(c.close));
-      } else {
-        // Early in the session: fall back to today's ticks of the same index
-        const history = await marketDataService.getSessionTickHistory(100, underlyingKey);
-        if (history.length < 25) return { shouldExit: false, reason: '' };
-        prices = history.map((t) => t.ltp);
-      }
+      // Same warm-up + session 5-min candles the entry used. No tick fallback: on 1-second ticks
+      // RSI hit 97 within two minutes and closed a trend winner at +13%.
+      const series = await historicalCandleService.getSeries(underlyingKey);
+      if (series.candles.length < 40) return { shouldExit: false, reason: '' };
+      candles = series.candles;
+      prices = candles.map((c) => c.close);
     } catch {
       return { shouldExit: false, reason: '' };
     }
 
     const isBullishPosition = position.symbol.endsWith('-CE'); // CE = expecting up move
 
-    // 1. Supertrend reversal (shares direction state with the SUPERTREND entry strategy)
-    const stDir = supertrend(prices, 10, 3.0, underlying + '_ST');
+    // 1. Supertrend reversal (same deterministic Supertrend as the SUPERTREND entry strategy)
+    const stDir = supertrend(candles, 10, 3.0);
     if (stDir) {
       const stBullish = stDir === 'BULLISH';
       if (isBullishPosition && !stBullish) {
@@ -765,12 +771,14 @@ class ExecutionService {
       return { shouldExit: true, reason: `TECH_REVERSAL: EMA golden cross while long PE (pnl=${pnlPct.toFixed(1)}%)` };
     }
 
-    // 3. RSI exhaustion — only exit at extreme levels
+    // 3. RSI exhaustion — only exit at extreme levels, and not while ADX shows a strong trend
+    //    (a strong trend holds RSI near the top for long stretches; the trailing stop manages it)
     const rsi14 = rsi(prices, 14);
-    if (isBullishPosition && rsi14 > 87) {
+    const strongTrend = adx(prices, 14).adx >= 25;
+    if (!strongTrend && isBullishPosition && rsi14 > 87) {
       return { shouldExit: true, reason: `TECH_REVERSAL: RSI exhaustion ${rsi14.toFixed(0)} while long CE (pnl=${pnlPct.toFixed(1)}%)` };
     }
-    if (!isBullishPosition && rsi14 < 13) {
+    if (!strongTrend && !isBullishPosition && rsi14 < 13) {
       return { shouldExit: true, reason: `TECH_REVERSAL: RSI exhaustion ${rsi14.toFixed(0)} while long PE (pnl=${pnlPct.toFixed(1)}%)` };
     }
 

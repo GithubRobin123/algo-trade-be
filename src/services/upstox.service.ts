@@ -277,6 +277,43 @@ export class UpstoxService {
     }
   }
 
+  /**
+   * OHLC candles from Upstox's V3 candle API (public — no access token needed), oldest first.
+   * `toDate`/`fromDate` are IST dates (YYYY-MM-DD); omit both for today's intraday candles.
+   * Upstox returns [timestamp, open, high, low, close, volume, oi] rows, newest first.
+   */
+  async getCandles(
+    instrumentKey: string,
+    intervalMinutes: number,
+    range?: { toDate: string; fromDate: string },
+  ): Promise<{ candleStart: Date; open: number; high: number; low: number; close: number; volume: number }[]> {
+    const key = encodeURIComponent(instrumentKey);
+    const path = range
+      ? `/v3/historical-candle/${key}/minutes/${intervalMinutes}/${range.toDate}/${range.fromDate}`
+      : `/v3/historical-candle/intraday/${key}/minutes/${intervalMinutes}`;
+
+    try {
+      const { data } = await this.client.get<Record<string, unknown>>(path, { headers: { Accept: 'application/json' } });
+      const rows = asRecord(data.data).candles;
+      if (!Array.isArray(rows)) return [];
+
+      return rows
+        .map((row) => (Array.isArray(row) ? row : []))
+        .map(([ts, open, high, low, close, volume]) => ({
+          candleStart: new Date(String(ts)),
+          open: toNumber(open) ?? NaN,
+          high: toNumber(high) ?? NaN,
+          low: toNumber(low) ?? NaN,
+          close: toNumber(close) ?? NaN,
+          volume: toNumber(volume) ?? 0,
+        }))
+        .filter((c) => !Number.isNaN(c.candleStart.getTime()) && [c.open, c.high, c.low, c.close].every(Number.isFinite))
+        .sort((a, b) => a.candleStart.getTime() - b.candleStart.getTime());
+    } catch (error) {
+      throw this.toApiError(error, 'Failed to fetch candles from Upstox');
+    }
+  }
+
   async getOptionContracts(
     accessToken: string,
     instrumentKey: string,

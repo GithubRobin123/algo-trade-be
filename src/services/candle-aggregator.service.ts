@@ -43,8 +43,9 @@ export function sessionStart(): Date {
   const istMs = now.getTime() + IST_OFFSET_MS;
   const istDate = new Date(istMs);
   const sessionIst = new Date(istDate);
-  sessionIst.setUTCHours(3, 45, 0, 0); // 09:15 IST = 03:45 UTC
-  if (istDate.getUTCHours() < 3 || (istDate.getUTCHours() === 3 && istDate.getUTCMinutes() < 45)) {
+  // istDate's UTC fields hold IST wall-clock time, so 09:15 here means 09:15 IST
+  sessionIst.setUTCHours(9, 15, 0, 0);
+  if (istDate.getUTCHours() < 9 || (istDate.getUTCHours() === 9 && istDate.getUTCMinutes() < 15)) {
     sessionIst.setUTCDate(sessionIst.getUTCDate() - 1);
   }
   return new Date(sessionIst.getTime() - IST_OFFSET_MS);

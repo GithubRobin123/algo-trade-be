@@ -4,13 +4,14 @@
  * Pluggable strategy registry. Each strategy implements the StrategyPlugin
  * interface and registers itself here.
  *
- * KEY FIX: All indicators now run on 5-minute candle closes (via ctx.candles[]).
- * If candles are unavailable (early in the session), falls back to ctx.prices[]
- * which are now session-only ticks (9:15 AM IST onwards).
+ * All indicators run on 5-minute candle closes (ctx.candles[] = previous-session warm-up + today,
+ * completed candles only — see historical-candle.service.ts). There is NO tick fallback: raw
+ * 1-second ticks gave ATR ≈ 1 point and RSI 97 on noise. A plugin that has too few candles is
+ * skipped, and every plugin records why it produced no signal in ctx.diagnostics.
  *
  * Additional fixes in this revision:
  *   - VWAP = session-only typical-price average (resets at 9:15 AM)
- *   - Stateful Supertrend: band state cached between calls
+ *   - Standard Supertrend computed over the candle series (deterministic)
  *   - dayHigh / dayLow from candle metadata, not rolling tick window
  *   - prevDayClose from candle.prevClose (Upstox full-quote OHLC)
  *   - ATM OI wired in from StrategyContext (no more hardcoded 0)
@@ -24,16 +25,18 @@
  *   6. SMA_PCR           — SMA crossover + PCR (most permissive, last resort)
  */
 
-import { Candle } from '../models/candle.model';
 import { env } from '../config/env';
 import { StrategySignal, StrategySource } from '../types/trading.types';
+import type { StrategyCandle } from './historical-candle.service';
 
 // ── Plugin interface ───────────────────────────────────────────────────────
 
 export interface StrategyContext {
   underlying: string;
-  prices: number[];          // session-only LTP ticks, oldest first (fallback)
-  candles: Candle[];         // 5-min OHLCV candles, oldest first (primary)
+  prices: number[];          // today's LTP ticks, oldest first (not used for indicators)
+  candles: StrategyCandle[]; // 5-min candles: warm-up sessions + today, oldest first
+  sessionCandles: StrategyCandle[]; // today's 5-min candles only (VWAP)
+  diagnostics?: Record<string, string>; // plugin name → why it produced no signal
   lastPrice: number;
   pcr: number;               // put-call ratio from ±10 ATM strikes
   atmStrike: number;
@@ -57,43 +60,29 @@ export interface StrategyContext {
 export interface StrategyPlugin {
   name: string;
   enabled: boolean;
-  minCandleLength: number;   // minimum 5-min candles needed
-  minTickLength: number;     // fallback minimum ticks if candles unavailable
+  minCandleLength: number;   // minimum 5-min candles needed (warm-up included)
   evaluate(ctx: StrategyContext): StrategySignal | null;
 }
 
 // ── Candle helpers ─────────────────────────────────────────────────────────
 
-/** Extract close prices from candles (primary) or raw ticks (fallback). */
+/** Close prices of the 5-minute candles (warm-up + today). */
 function closePrices(ctx: StrategyContext): number[] {
-  if (ctx.candles.length >= 5) {
-    return ctx.candles.map((c) => Number(c.close));
-  }
-  return ctx.prices;
+  return ctx.candles.map((c) => Number(c.close));
 }
 
-/** Session VWAP using candles (typical price = (H+L+C)/3). Resets at 9:15 AM IST. */
+/** Session VWAP from today's candles (typical price = (H+L+C)/3). Resets at 9:15 AM IST. */
 function sessionVwap(ctx: StrategyContext): number {
-  if (ctx.candles.length >= 2) {
-    let sumTP = 0, count = 0;
-    for (const c of ctx.candles) {
-      sumTP += (Number(c.high) + Number(c.low) + Number(c.close)) / 3;
-      count++;
-    }
-    return sumTP / count;
-  }
-  // Fallback: session-tick average (already date-filtered)
-  if (ctx.prices.length > 0) {
-    return ctx.prices.reduce((s, v) => s + v, 0) / ctx.prices.length;
-  }
-  return ctx.lastPrice;
+  if (!ctx.sessionCandles.length) return ctx.lastPrice;
+  const sumTP = ctx.sessionCandles.reduce((s, c) => s + (Number(c.high) + Number(c.low) + Number(c.close)) / 3, 0);
+  return sumTP / ctx.sessionCandles.length;
 }
 
-// ── Stateful Supertrend band cache ─────────────────────────────────────────
-// Maps instrumentKey → {upperBand, lowerBand, direction}
-// Prevents direction oscillation between calls (key property of real Supertrend).
-interface SupertrendState { upperBand: number; lowerBand: number; direction: 'BULLISH' | 'BEARISH' }
-const supertrendStateCache = new Map<string, SupertrendState>();
+/** Records why a plugin produced no signal (logged with NO_SIGNAL decisions) and returns null. */
+function skip(ctx: StrategyContext, plugin: string, reason: string): null {
+  if (ctx.diagnostics) ctx.diagnostics[plugin] = reason;
+  return null;
+}
 
 // ── Math helpers ──────────────────────────────────────────────────────────
 
@@ -215,49 +204,46 @@ export function adx(prices: number[], period = 14): { adx: number; trending: boo
 }
 
 /**
- * Stateful Supertrend — uses module-level cache to prevent direction oscillation.
- * @param cacheKey  unique key per instrument (e.g., instrumentKey)
+ * Standard Supertrend (HL2 ± multiplier × Wilder true-range ATR, ratcheting final bands) computed
+ * bar by bar over the whole candle series, so the result depends only on the candles. The
+ * previous version kept the direction in a module-level cache between calls, so the same candles
+ * could give BULLISH or BEARISH depending on call history (process restart, entry vs exit check).
  */
 export function supertrend(
-  prices: number[],
+  candles: StrategyCandle[],
   period = 10,
   multiplier = 3.0,
-  cacheKey = 'default',
 ): 'BULLISH' | 'BEARISH' | null {
-  if (prices.length < period * 2 + 2) return null;
+  if (candles.length < period * 2 + 2) return null;
 
-  const atrValue = atr(prices, period);
-  if (atrValue === 0) return null;
+  let atrValue = 0;
+  let finalUpper = 0;
+  let finalLower = 0;
+  let direction: 'BULLISH' | 'BEARISH' = 'BULLISH';
 
-  const computeBands = (slice: number[]): { upper: number; lower: number } => {
-    const h = Math.max(...slice.slice(-period));
-    const l = Math.min(...slice.slice(-period));
-    const mid = (h + l) / 2;
-    return { upper: mid + multiplier * atrValue, lower: mid - multiplier * atrValue };
-  };
+  for (let i = 1; i < candles.length; i++) {
+    const { high, low, close } = candles[i];
+    const prevClose = candles[i - 1].close;
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+    atrValue = i <= period ? atrValue + tr / period : (atrValue * (period - 1) + tr) / period;
+    if (i < period) continue;
 
-  const currBands = computeBands(prices);
-  const currPrice = prices[prices.length - 1];
-
-  const prev = supertrendStateCache.get(cacheKey);
-
-  let direction: 'BULLISH' | 'BEARISH';
-
-  if (!prev) {
-    // No prior state: derive from current price vs bands
-    direction = currPrice > currBands.upper ? 'BULLISH' : currPrice < currBands.lower ? 'BEARISH' : (ema(prices, 9) > ema(prices, 21) ? 'BULLISH' : 'BEARISH');
-  } else {
-    // Stateful: only flip direction when price crosses the band from the PREVIOUS state
-    if (prev.direction === 'BULLISH' && currPrice < currBands.lower) {
-      direction = 'BEARISH';
-    } else if (prev.direction === 'BEARISH' && currPrice > currBands.upper) {
-      direction = 'BULLISH';
-    } else {
-      direction = prev.direction; // sustain until confirmed breakout
+    const hl2 = (high + low) / 2;
+    const basicUpper = hl2 + multiplier * atrValue;
+    const basicLower = hl2 - multiplier * atrValue;
+    if (i === period) {
+      finalUpper = basicUpper;
+      finalLower = basicLower;
+      direction = close >= hl2 ? 'BULLISH' : 'BEARISH';
+      continue;
     }
+
+    finalUpper = basicUpper < finalUpper || prevClose > finalUpper ? basicUpper : finalUpper;
+    finalLower = basicLower > finalLower || prevClose < finalLower ? basicLower : finalLower;
+    if (direction === 'BEARISH' && close > finalUpper) direction = 'BULLISH';
+    else if (direction === 'BULLISH' && close < finalLower) direction = 'BEARISH';
   }
 
-  supertrendStateCache.set(cacheKey, { upperBand: currBands.upper, lowerBand: currBands.lower, direction });
   return direction;
 }
 
@@ -277,7 +263,7 @@ export function stochastic(prices: number[], period = 14, smoothing = 3): { k: n
 }
 
 // An ATM option moves roughly half as many points as the index
-const ATM_DELTA = 0.5;
+export const ATM_DELTA = 0.5;
 
 /**
  * ATR-based stop-loss distance as a fraction of the option premium. The index ATR is first
@@ -301,20 +287,17 @@ function atrStopLoss(optionLtp: number, underlyingAtr: number): number {
 const supertrendStrategy: StrategyPlugin = {
   name: 'SUPERTREND',
   enabled: true,
-  minCandleLength: 25,
-  minTickLength: 50,
+  minCandleLength: 30, // adx() needs 28
 
   evaluate(ctx: StrategyContext): StrategySignal | null {
     const prices = closePrices(ctx);
-    if (prices.length < this.minTickLength && ctx.candles.length < this.minCandleLength) return null;
-
     const { lastPrice, callInstrumentKey, putInstrumentKey, callLtp, putLtp, lotSize, underlying, expiryDate, timeIST, minutesToClose, atmStrike, pcr } = ctx;
 
-    const stDirection = supertrend(prices, 10, 3.0, ctx.underlying + '_ST');
-    if (!stDirection) return null;
+    const stDirection = supertrend(ctx.candles, 10, 3.0);
+    if (!stDirection) return skip(ctx, this.name, 'supertrend not ready');
 
     const { adx: adxVal, trending } = adx(prices, 14);
-    if (!trending) return null; // ADX < 20: choppy — skip
+    if (!trending) return skip(ctx, this.name, `ADX ${adxVal.toFixed(0)} < 20 (choppy)`);
 
     const rsi14 = rsi(prices, 14);
     const ema9Val = ema(prices, 9);
@@ -324,21 +307,23 @@ const supertrendStrategy: StrategyPlugin = {
     const bullish = stDirection === 'BULLISH';
     const bearish = stDirection === 'BEARISH';
 
-    if (bullish && ema9Val < ema21Val) return null; // EMA disagrees
-    if (bearish && ema9Val > ema21Val) return null;
-    if (bullish && rsi14 > 75) return null;          // overbought
-    if (bearish && rsi14 < 25) return null;           // oversold
+    if (bullish && ema9Val < ema21Val) return skip(ctx, this.name, 'supertrend BULLISH but EMA9 < EMA21');
+    if (bearish && ema9Val > ema21Val) return skip(ctx, this.name, 'supertrend BEARISH but EMA9 > EMA21');
+    // A strong trend (ADX ≥ 25) runs at high RSI for long stretches — only block real blow-offs there
+    const rsiCap = adxVal >= 25 ? 82 : 75;
+    if (bullish && rsi14 > rsiCap) return skip(ctx, this.name, `RSI ${rsi14.toFixed(0)} > ${rsiCap} (overbought)`);
+    if (bearish && rsi14 < 100 - rsiCap) return skip(ctx, this.name, `RSI ${rsi14.toFixed(0)} < ${100 - rsiCap} (oversold)`);
 
     const optionKey = bullish ? callInstrumentKey : putInstrumentKey;
     const optionLtp = bullish ? callLtp : putLtp;
-    if (!optionKey || !optionLtp || optionLtp <= 0) return null;
+    if (!optionKey || !optionLtp || optionLtp <= 0) return skip(ctx, this.name, 'ATM option price unavailable');
 
     const priceAboveVwap = lastPrice > vwapVal;
     const adxBonus = Math.min(0.15, (adxVal - 20) / 200);
     const vwapBonus = (bullish && priceAboveVwap) || (!bullish && !priceAboveVwap) ? 0.07 : 0;
     const rsiBonus = bullish ? Math.max(0, (55 - rsi14) / 200) : Math.max(0, (rsi14 - 45) / 200);
     const confidence = Math.min(0.90, 0.62 + adxBonus + vwapBonus + rsiBonus);
-    if (confidence < env.strategyConfidenceThreshold) return null;
+    if (confidence < env.strategyConfidenceThreshold) return skip(ctx, this.name, `confidence ${confidence.toFixed(2)} < ${env.strategyConfidenceThreshold}`);
 
     const atrVal = atr(prices, 14);
     const sl = atrStopLoss(optionLtp, atrVal);
@@ -372,12 +357,9 @@ const emaCrossStrategy: StrategyPlugin = {
   name: 'EMA_CROSS',
   enabled: true,
   minCandleLength: 25,
-  minTickLength: 50,
 
   evaluate(ctx: StrategyContext): StrategySignal | null {
     const prices = closePrices(ctx);
-    if (prices.length < 22) return null;
-
     const { lastPrice, callInstrumentKey, putInstrumentKey, callLtp, putLtp, lotSize, underlying, expiryDate, timeIST, minutesToClose, atmStrike, pcr } = ctx;
 
     const ema9Now = ema(prices, 9);
@@ -387,20 +369,20 @@ const emaCrossStrategy: StrategyPlugin = {
 
     const goldenCross = ema9Prev <= ema21Prev && ema9Now > ema21Now;
     const deathCross = ema9Prev >= ema21Prev && ema9Now < ema21Now;
-    if (!goldenCross && !deathCross) return null;
+    if (!goldenCross && !deathCross) return skip(ctx, this.name, 'no EMA9/EMA21 cross on the last candle');
 
     const rsi14 = rsi(prices, 14);
-    if (goldenCross && rsi14 > 72) return null;
-    if (deathCross && rsi14 < 28) return null;
+    if (goldenCross && rsi14 > 72) return skip(ctx, this.name, `golden cross but RSI ${rsi14.toFixed(0)} > 72`);
+    if (deathCross && rsi14 < 28) return skip(ctx, this.name, `death cross but RSI ${rsi14.toFixed(0)} < 28`);
 
     const bullish = goldenCross;
     const optionKey = bullish ? callInstrumentKey : putInstrumentKey;
     const optionLtp = bullish ? callLtp : putLtp;
-    if (!optionKey || !optionLtp || optionLtp <= 0) return null;
+    if (!optionKey || !optionLtp || optionLtp <= 0) return skip(ctx, this.name, 'ATM option price unavailable');
 
     const emaDiff = Math.abs(ema9Now - ema21Now) / lastPrice;
     const confidence = Math.min(0.88, 0.58 + emaDiff * 50 + Math.abs(rsi14 - 50) * 0.004);
-    if (confidence < env.strategyConfidenceThreshold) return null;
+    if (confidence < env.strategyConfidenceThreshold) return skip(ctx, this.name, `confidence ${confidence.toFixed(2)} < ${env.strategyConfidenceThreshold}`);
 
     const atrVal = atr(prices, 14);
     const sl = atrStopLoss(optionLtp, atrVal);
@@ -432,12 +414,11 @@ const emaCrossStrategy: StrategyPlugin = {
 const vwapBounceStrategy: StrategyPlugin = {
   name: 'VWAP_BOUNCE',
   enabled: true,
-  minCandleLength: 10,
-  minTickLength: 20,
+  minCandleLength: 15,
 
   evaluate(ctx: StrategyContext): StrategySignal | null {
     const prices = closePrices(ctx);
-    if (prices.length < 5) return null;
+    if (!ctx.sessionCandles.length) return skip(ctx, this.name, 'no completed candle today yet (VWAP)');
 
     const { lastPrice, callInstrumentKey, putInstrumentKey, callLtp, putLtp, lotSize, underlying, expiryDate, timeIST, minutesToClose, atmStrike } = ctx;
 
@@ -448,21 +429,23 @@ const vwapBounceStrategy: StrategyPlugin = {
 
     const crossedAbove = prev < vwapVal && lastPrice > vwapVal;
     const crossedBelow = prev > vwapVal && lastPrice < vwapVal;
-    if (!crossedAbove && !crossedBelow) return null;
+    if (!crossedAbove && !crossedBelow) {
+      return skip(ctx, this.name, `no VWAP cross (price staying ${lastPrice > vwapVal ? 'above' : 'below'} VWAP ${vwapVal.toFixed(0)})`);
+    }
 
     const bullish = crossedAbove && rsi14 < 70 && ema9Val > vwapVal;
     const bearish = crossedBelow && rsi14 > 30 && ema9Val < vwapVal;
-    if (!bullish && !bearish) return null;
+    if (!bullish && !bearish) return skip(ctx, this.name, `VWAP cross not confirmed by RSI ${rsi14.toFixed(0)} / EMA9`);
 
     const optionKey = bullish ? callInstrumentKey : putInstrumentKey;
     const optionLtp = bullish ? callLtp : putLtp;
-    if (!optionKey || !optionLtp || optionLtp <= 0) return null;
+    if (!optionKey || !optionLtp || optionLtp <= 0) return skip(ctx, this.name, 'ATM option price unavailable');
 
     const vwapDist = Math.abs(lastPrice - vwapVal) / (vwapVal || 1);
     const proximityBonus = Math.max(0, 1 - vwapDist * 100) * 0.25;
     const rsiBonus = bullish ? Math.max(0, (60 - rsi14) / 100) * 0.1 : Math.max(0, (rsi14 - 40) / 100) * 0.1;
     const confidence = Math.min(0.85, 0.55 + proximityBonus + rsiBonus);
-    if (confidence < env.strategyConfidenceThreshold) return null;
+    if (confidence < env.strategyConfidenceThreshold) return skip(ctx, this.name, `confidence ${confidence.toFixed(2)} < ${env.strategyConfidenceThreshold}`);
 
     const atrVal = atr(prices, 14);
     const sl = atrStopLoss(optionLtp, atrVal);
@@ -490,13 +473,10 @@ const vwapBounceStrategy: StrategyPlugin = {
 const bollingerBreakoutStrategy: StrategyPlugin = {
   name: 'BOLLINGER_BREAKOUT',
   enabled: true,
-  minCandleLength: 20,
-  minTickLength: 40,
+  minCandleLength: 25,
 
   evaluate(ctx: StrategyContext): StrategySignal | null {
     const prices = closePrices(ctx);
-    if (prices.length < 20) return null;
-
     const { lastPrice, callInstrumentKey, putInstrumentKey, callLtp, putLtp, lotSize, underlying, expiryDate, timeIST, minutesToClose, atmStrike, pcr } = ctx;
 
     const bb = bollingerBands(prices, 20, 2.0);
@@ -511,7 +491,7 @@ const bollingerBreakoutStrategy: StrategyPlugin = {
       // In a clear downtrend (EMA9 < EMA21) with wide/expanding bands, a lower-bounce CALL has
       // negative edge — only allow if it's a tight squeeze (bandwidth < 0.20%) where mean
       // reversion is structurally favoured (as confirmed by June 5 vs June 10 data).
-      if (ema9Val < ema21Val && bb.bandwidth > 0.20) return null;
+      if (ema9Val < ema21Val && bb.bandwidth > 0.20) return skip(ctx, this.name, 'lower-band touch in a downtrend with wide bands');
       bullish = true; signalType = 'BB_LOWER_BOUNCE';
     } else if (bb.percentB >= 0.95 && rsi14 > 62 && ema9Val <= ema21Val * 1.002) {
       bullish = false; signalType = 'BB_UPPER_REVERSAL';
@@ -528,17 +508,17 @@ const bollingerBreakoutStrategy: StrategyPlugin = {
       }
     }
 
-    if (bullish === null) return null;
+    if (bullish === null) return skip(ctx, this.name, `no band setup (%B ${(bb.percentB * 100).toFixed(0)}%, bandwidth ${bb.bandwidth.toFixed(2)}%)`);
 
     const optionKey = bullish ? callInstrumentKey : putInstrumentKey;
     const optionLtp = bullish ? callLtp : putLtp;
-    if (!optionKey || !optionLtp || optionLtp <= 0) return null;
+    if (!optionKey || !optionLtp || optionLtp <= 0) return skip(ctx, this.name, 'ATM option price unavailable');
 
     const extremeBonus = signalType.includes('BOUNCE') || signalType.includes('REVERSAL')
       ? Math.min(0.15, (bullish ? (0.05 - bb.percentB) : (bb.percentB - 0.95)) * 5) : 0.05;
     const rsiBonus = bullish ? Math.max(0, (38 - rsi14) / 200) : Math.max(0, (rsi14 - 62) / 200);
     const confidence = Math.min(0.87, 0.57 + extremeBonus + rsiBonus);
-    if (confidence < env.strategyConfidenceThreshold) return null;
+    if (confidence < env.strategyConfidenceThreshold) return skip(ctx, this.name, `${signalType} confidence ${confidence.toFixed(2)} < ${env.strategyConfidenceThreshold}`);
 
     const atrVal = atr(prices, 14);
     const sl = atrStopLoss(optionLtp, atrVal);
@@ -568,13 +548,10 @@ const bollingerBreakoutStrategy: StrategyPlugin = {
 const stochasticMomentumStrategy: StrategyPlugin = {
   name: 'STOCHASTIC_MOMENTUM',
   enabled: true,
-  minCandleLength: 20,
-  minTickLength: 40,
+  minCandleLength: 35, // MACD needs 35
 
   evaluate(ctx: StrategyContext): StrategySignal | null {
     const prices = closePrices(ctx);
-    if (prices.length < 20) return null;
-
     const { lastPrice, callInstrumentKey, putInstrumentKey, callLtp, putLtp, lotSize, underlying, expiryDate, timeIST, minutesToClose, atmStrike, pcr } = ctx;
 
     const curr = stochastic(prices, 14, 3);
@@ -583,27 +560,27 @@ const stochasticMomentumStrategy: StrategyPlugin = {
     // Require %K >= 5 (bullish) / <= 95 (bearish) — a cross at single-digit values is noise
     const bullishCross = prev.k < prev.d && curr.k > curr.d && curr.k < 30 && curr.d < 30 && curr.k >= 5;
     const bearishCross = prev.k > prev.d && curr.k < curr.d && curr.k > 70 && curr.d > 70 && curr.k <= 95;
-    if (!bullishCross && !bearishCross) return null;
+    if (!bullishCross && !bearishCross) return skip(ctx, this.name, `no %K/%D cross in an extreme zone (%K ${curr.k.toFixed(0)})`);
 
     const { macdLine, signalLine, histogram } = macd(prices);
     const prevMacd = macd(prices.slice(0, -1));
-    if (bullishCross && histogram < prevMacd.histogram) return null;
-    if (bearishCross && histogram > prevMacd.histogram) return null;
+    if (bullishCross && histogram < prevMacd.histogram) return skip(ctx, this.name, 'bullish stochastic cross but MACD histogram falling');
+    if (bearishCross && histogram > prevMacd.histogram) return skip(ctx, this.name, 'bearish stochastic cross but MACD histogram rising');
 
     const ema9Val = ema(prices, 9);
     const ema21Val = ema(prices, 21);
-    if (bullishCross && ema9Val < ema21Val * 0.995) return null;
-    if (bearishCross && ema9Val > ema21Val * 1.005) return null;
+    if (bullishCross && ema9Val < ema21Val * 0.995) return skip(ctx, this.name, 'bullish stochastic cross against EMA downtrend');
+    if (bearishCross && ema9Val > ema21Val * 1.005) return skip(ctx, this.name, 'bearish stochastic cross against EMA uptrend');
 
     const bullish = bullishCross;
     const optionKey = bullish ? callInstrumentKey : putInstrumentKey;
     const optionLtp = bullish ? callLtp : putLtp;
-    if (!optionKey || !optionLtp || optionLtp <= 0) return null;
+    if (!optionKey || !optionLtp || optionLtp <= 0) return skip(ctx, this.name, 'ATM option price unavailable');
 
     const extremeDepth = bullish ? Math.max(0, 20 - curr.k) / 100 : Math.max(0, curr.k - 80) / 100;
     const macdBonus = bullish ? Math.min(0.08, Math.max(0, histogram) * 10) : Math.min(0.08, Math.max(0, -histogram) * 10);
     const confidence = Math.min(0.86, 0.60 + extremeDepth + macdBonus);
-    if (confidence < env.strategyConfidenceThreshold) return null;
+    if (confidence < env.strategyConfidenceThreshold) return skip(ctx, this.name, `confidence ${confidence.toFixed(2)} < ${env.strategyConfidenceThreshold}`);
 
     const atrVal = atr(prices, 14);
     const sl = atrStopLoss(optionLtp, atrVal);
@@ -633,13 +610,10 @@ const stochasticMomentumStrategy: StrategyPlugin = {
 const smaPcrStrategy: StrategyPlugin = {
   name: 'SMA_PCR',
   enabled: true,
-  minCandleLength: 30,
-  minTickLength: 60,
+  minCandleLength: 40,
 
   evaluate(ctx: StrategyContext): StrategySignal | null {
     const prices = closePrices(ctx);
-    if (prices.length < 40) return null;
-
     const { lastPrice, pcr, callInstrumentKey, putInstrumentKey, callLtp, putLtp, lotSize, underlying, expiryDate, timeIST, minutesToClose, atmStrike } = ctx;
 
     const smaFast = avg(prices.slice(-10));
@@ -648,18 +622,18 @@ const smaPcrStrategy: StrategyPlugin = {
 
     const bullish = smaFast > smaSlow && momentum > 0 && pcr >= 1;
     const bearish = smaFast < smaSlow && momentum < 0 && pcr <= 1;
-    if (!bullish && !bearish) return null;
+    if (!bullish && !bearish) return skip(ctx, this.name, `SMA10/30, momentum and PCR ${pcr.toFixed(2)} not aligned`);
 
     const optionKey = bullish ? callInstrumentKey : putInstrumentKey;
     const optionLtp = bullish ? callLtp : putLtp;
-    if (!optionKey || !optionLtp || optionLtp <= 0) return null;
+    if (!optionKey || !optionLtp || optionLtp <= 0) return skip(ctx, this.name, 'ATM option price unavailable');
 
     const confidence = Math.min(0.99,
       0.5 + Math.abs((smaFast - smaSlow) / lastPrice) * 8
           + Math.abs(pcr - 1) * 0.18
           + Math.abs(momentum) * 4,
     );
-    if (confidence < env.strategyConfidenceThreshold) return null;
+    if (confidence < env.strategyConfidenceThreshold) return skip(ctx, this.name, `confidence ${confidence.toFixed(2)} < ${env.strategyConfidenceThreshold}`);
 
     const rsi14 = rsi(prices, 14);
     const ema9 = ema(prices, 9);
@@ -705,14 +679,21 @@ class StrategyRegistry {
 
   register(plugin: StrategyPlugin): void { this.plugins.push(plugin); }
 
+  /** Best signal by confidence, or null. */
   runAll(ctx: StrategyContext): { signal: StrategySignal; strategyName: string } | null {
+    return this.evaluateAll(ctx)[0] ?? null;
+  }
+
+  /** Every plugin's signal, highest confidence first (plugins that returned null are in ctx.diagnostics). */
+  evaluateAll(ctx: StrategyContext): { signal: StrategySignal; strategyName: string }[] {
     const candidates: { signal: StrategySignal; strategyName: string }[] = [];
 
     for (const plugin of this.plugins) {
       if (!plugin.enabled) continue;
-      const hasEnoughCandles = ctx.candles.length >= plugin.minCandleLength;
-      const hasEnoughTicks = ctx.prices.length >= plugin.minTickLength;
-      if (!hasEnoughCandles && !hasEnoughTicks) continue;
+      if (ctx.candles.length < plugin.minCandleLength) {
+        skip(ctx, plugin.name, `warming up: ${ctx.candles.length}/${plugin.minCandleLength} candles`);
+        continue;
+      }
 
       try {
         const signal = plugin.evaluate(ctx);
@@ -722,12 +703,12 @@ class StrategyRegistry {
       }
     }
 
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => b.signal.confidence - a.signal.confidence);
-    return candidates[0];
+    return candidates.sort((a, b) => b.signal.confidence - a.signal.confidence);
   }
 
   getEnabled(): string[] { return this.plugins.filter((p) => p.enabled).map((p) => p.name); }
+
+  listNames(): string[] { return this.plugins.map((p) => p.name); }
 
   setEnabled(name: string, enabled: boolean): boolean {
     const plugin = this.plugins.find((p) => p.name === name);

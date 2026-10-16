@@ -34,6 +34,24 @@ export const getReportSummary = async (
   }
 };
 
+export const getStrategyPerformance = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const days = parseDays(req.query.days, 90);
+    const rows = await reportService.getStrategyPerformance(days);
+
+    res.json({
+      success: true,
+      data: rows,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const getDailyReport = async (
   req: Request,
   res: Response,
