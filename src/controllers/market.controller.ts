@@ -207,13 +207,15 @@ export const getOptionChain = async (req: Request, res: Response, next: NextFunc
     const expiryDate = typeof req.query.expiryDate === 'string' ? req.query.expiryDate : undefined;
     const shouldRefresh = parseBoolean(req.query.refresh, false);
     const symbolOrInstrument = resolveUnderlyingForOption(req);
+    // A chain viewed for a chosen expiry goes only to this caller, not to every dashboard
+    const fetchChain = () => marketDataService.fetchAndStoreOptionChain(expiryDate, symbolOrInstrument, { broadcast: !expiryDate });
 
     let data = shouldRefresh
-      ? await marketDataService.fetchAndStoreOptionChain(expiryDate, symbolOrInstrument)
+      ? await fetchChain()
       : await marketDataService.getLatestOptionChain(expiryDate, symbolOrInstrument);
 
     if (!data) {
-      data = await marketDataService.fetchAndStoreOptionChain(expiryDate, symbolOrInstrument);
+      data = await fetchChain();
     }
 
     res.json({
@@ -228,5 +230,15 @@ export const getOptionChain = async (req: Request, res: Response, next: NextFunc
 
     process.stderr.write(`[Market] Option chain request failed: ${String(error)}\n`);
     next(new ApiError(500, 'Failed to fetch option chain'));
+  }
+};
+
+/** Listed option expiries for the chain dropdown, and the expiry the strategy trades today. */
+export const getOptionExpiries = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const data = await marketDataService.getExpiryInfo(resolveUnderlyingForOption(req));
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
   }
 };

@@ -69,6 +69,19 @@ const STREAM_FRESH_MS = 10_000;
 // ── Option chain snapshot: only insert if last snapshot is >4 min old ─────
 const MIN_CHAIN_SNAPSHOT_GAP_MS = 4 * 60 * 1000;
 
+// Calendar date in IST (YYYY-MM-DD)
+const istToday = (): string => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
+
+export interface OptionExpiryInfo {
+  symbol: string;
+  today: string;
+  expiries: string[];
+  nearestExpiry: string | null;
+  /** Expiry the strategy buys: the nearest one, or the next one on expiry day */
+  tradingExpiry: string | null;
+  isExpiryDay: boolean;
+}
+
 class MarketDataService {
   private pollTimer: NodeJS.Timeout | null = null;
   private hasLoggedAuthWarning = false;
@@ -77,6 +90,8 @@ class MarketDataService {
   private lastChainFetchAt = new Map<string, number>();
   private lastChainData = new Map<string, NormalizedOptionChain>();
   private lotSizeCache = new Map<string, number>();
+  // Listed option expiries per instrument, refreshed once a day (the contract list is large)
+  private expiryCache = new Map<string, { day: string; expiries: string[] }>();
   // Last time a tick for each instrument arrived from the WebSocket stream
   private lastStreamTickAt = new Map<string, number>();
 
@@ -270,10 +285,55 @@ class MarketDataService {
     return fallback;
   }
 
+  /**
+   * Chain the strategy trades from: the nearest expiry, or on expiry day the next one — contracts
+   * expiring today are never bought, but the day is still traded. The next-expiry chain is not
+   * broadcast, so the dashboard keeps showing the nearest expiry.
+   */
+  async fetchTradableOptionChain(symbol: string): Promise<NormalizedOptionChain> {
+    const nearest = await this.fetchAndStoreOptionChain(undefined, symbol);
+    if (nearest.expiryDate !== istToday()) return nearest;
+
+    const { tradingExpiry } = await this.getExpiryInfo(symbol);
+    return tradingExpiry && tradingExpiry !== nearest.expiryDate
+      ? this.fetchAndStoreOptionChain(tradingExpiry, symbol, { broadcast: false })
+      : nearest;
+  }
+
+  /** Listed expiries from today on, and the one the strategy trades (the next one on expiry day). */
+  async getExpiryInfo(symbolOrInstrument?: string): Promise<OptionExpiryInfo> {
+    const underlying = underlyingService.resolve(symbolOrInstrument);
+    const today = istToday();
+    const expiries = underlying.supportsOptions
+      ? (await this.getOptionExpiries(underlying.optionChainInstrumentKey)).filter((e) => e >= today)
+      : [];
+    const isExpiryDay = expiries[0] === today;
+    return {
+      symbol: underlying.symbol,
+      today,
+      expiries,
+      nearestExpiry: expiries[0] ?? null,
+      tradingExpiry: (isExpiryDay ? expiries[1] : expiries[0]) ?? null,
+      isExpiryDay,
+    };
+  }
+
+  private async getOptionExpiries(instrumentKey: string): Promise<string[]> {
+    const today = istToday();
+    const cached = this.expiryCache.get(instrumentKey);
+    if (cached?.day === today) return cached.expiries;
+
+    const accessToken = await tokenService.getValidAccessToken();
+    const expiries = await upstoxService.getAvailableExpiries(accessToken, instrumentKey);
+    if (expiries.length) this.expiryCache.set(instrumentKey, { day: today, expiries });
+    return expiries;
+  }
+
   /** Fetch and store option chain. Inserts a new snapshot (not upsert) if last one is >4 min old. */
   async fetchAndStoreOptionChain(
     expiryDate?: string,
     symbolOrInstrument?: string,
+    { broadcast = true }: { broadcast?: boolean } = {},
   ): Promise<NormalizedOptionChain> {
     const underlying = underlyingService.resolve(symbolOrInstrument);
 
@@ -302,7 +362,7 @@ class MarketDataService {
     this.lastChainData.set(cacheKey, normalized);
 
     await this.insertOptionChainSnapshot(normalized);
-    websocketService.broadcast('option_chain', normalized);
+    if (broadcast) websocketService.broadcast('option_chain', normalized);
     return normalized;
   }
 
@@ -349,7 +409,8 @@ class MarketDataService {
       // Only return snapshots whose expiry is today or in the future — never stale past-expiry data
       ...(expiryDate ? { expiryDate } : { expiryDate: { [Op.gte]: today } }),
     };
-    const snapshot = await OptionChainSnapshot.findOne({ where, order: [['snapshotTime', 'DESC']] });
+    // Nearest expiry first: on expiry day the strategy also stores next-expiry snapshots
+    const snapshot = await OptionChainSnapshot.findOne({ where, order: [['expiryDate', 'ASC'], ['snapshotTime', 'DESC']] });
     if (!snapshot) return null;
     return {
       symbol: snapshot.symbol,

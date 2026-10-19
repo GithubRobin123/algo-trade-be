@@ -46,6 +46,12 @@ Changes:
   `max(6% of best premium, 1.5 × ATM delta × entry ATR)`.
 - **Diagnostics.** NO_SIGNAL logs now record why each strategy said no (`strategyDiagnostics`).
 - **Bug fix.** `sessionStart()` returned 03:45 IST instead of 09:15.
+- **Expiry day is traded with the next expiry** (added 2026-10-20, before v2.0's first deploy).
+  v1 skipped the whole day when the nearest expiry was today: every Tuesday, and on Monday
+  19 Oct, when the Dussehra holiday moved the expiry, it logged ~1,000 `EXPIRY_DAY` rejections
+  and took no trade. Now the chain, ATM strike, premium, PCR and lot size come from the next
+  expiry on that day. Contracts expiring today are still never bought. The backtest already
+  traded every day, so its numbers below are unchanged.
 
 Parameters changed in `.env`:
 

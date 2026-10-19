@@ -268,15 +268,16 @@ class StrategyService {
       const prices = history.map((t) => t.ltp);
       const lastPrice = latestIndexPrice ?? candles[candles.length - 1].close;
 
-      // Option chain
-      const chain = await marketDataService.fetchAndStoreOptionChain(undefined, underlying.symbol).catch(() => null);
+      // Option chain — on expiry day this is the next expiry's chain
+      const chain = await marketDataService.fetchTradableOptionChain(underlying.symbol).catch(() => null);
       if (!chain?.expiryDate) {
         await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'NO_SIGNAL', rejectionReason: 'Option chain not available', latencyMs: Date.now() - cycleStart });
         return { signal: null, intentId: null, logId: null, decisionSource: 'no-chain', strategyName: null };
       }
 
+      // Only when Upstox lists no later expiry — never buy contracts that expire today
       if (chain.expiryDate === sameDayIso()) {
-        await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'EXPIRY_DAY', rejectionReason: 'Today is expiry day', latencyMs: Date.now() - cycleStart });
+        await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'EXPIRY_DAY', rejectionReason: 'Today is expiry day and no later expiry is listed', latencyMs: Date.now() - cycleStart });
         return { signal: null, intentId: null, logId: null, decisionSource: 'expiry-day', strategyName: null };
       }
 
