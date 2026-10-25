@@ -111,11 +111,15 @@ export const env = {
   strategySlMaxPct: getNumber('STRATEGY_SL_MAX_PCT', 30),
   // Trailing stop distance = max(TRAIL_OFFSET_PCT of best premium, multiplier × ATM-delta × entry index ATR)
   strategyTrailAtrMultiplier: getNumber('STRATEGY_TRAIL_ATR_MULTIPLIER', 1.5),
+  // Before the trail activates, move the stop to entry + 1% once the premium is up this much (0 = off)
+  strategyBreakevenTriggerPct: getNumber('STRATEGY_BREAKEVEN_TRIGGER_PCT', 10),
+  // No new entry for this many minutes after a losing exit (0 = off)
+  strategyLossCooldownMinutes: getNumber('STRATEGY_LOSS_COOLDOWN_MINUTES', 15),
   // Previous full sessions of 5-min candles loaded as indicator warm-up (75 candles per session)
   strategyWarmupSessions: getNumber('STRATEGY_WARMUP_SESSIONS', 2),
   // Stamped on every decision, intent and position so results can be compared per version.
   // Bump it in code whenever entry/exit logic changes (env parameters are stamped separately).
-  strategyVersion: 'v2.0',
+  strategyVersion: 'v2.1',
   // How long a strategy intent waits for manual approval before it expires
   intentExpiryMinutes: getNumber('INTENT_EXPIRY_MINUTES', 2),
 

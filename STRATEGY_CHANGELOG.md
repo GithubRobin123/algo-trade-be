@@ -12,9 +12,62 @@ Rules for changes:
 - Parameter-only changes (`.env`) don't need a bump; they are stamped on each trade anyway.
 - Judge a version on at least 10 trading days (≈ 50 trades) before changing it again.
 - Before deploying a change, compare it with the previous version on the same candles:
-  `npm run build && node dist/scripts/backtest-strategies.js 40 out.json`.
-  The script ignores parameter overrides on the command line because `.env` wins, so set
-  parameters in `.env`.
+  `npm run build && BACKTEST_FROM=2026-01-01 node dist/scripts/backtest-strategies.js 0 out.json`.
+  Command-line parameter overrides are ignored because `.env` wins. To compare settings, list them
+  in a JSON file passed as `BACKTEST_VARIANTS=<file>` (`[{ "name": "...", "env": { "strategyLossCooldownMinutes": 30 } }]`),
+  and set `BACKTEST_CACHE=<file>` so every run uses the same candles.
+- Accept a change only if it helps in both Jan–Jun and Jul–Oct, and nearby values help too.
+
+---
+
+## v2.1 (2026-10-24)
+
+Why: in the week of 21–23 Oct v2.0 made 10 trades, 3 winners, −₹5,385 gross. No target was hit.
+- After a stop loss the bot re-entered in the same direction 1–13 seconds later (#37, #38, #40).
+  The 5-minute signal cooldown counts from the previous entry, which a stopped trade has usually
+  outlived. On 23 Oct afternoon three CALLs lost ₹3,790 in 11 minutes.
+- Trades that were up +13% to +16% (#33, #41) fell back to the full stop loss.
+- The trailing-stop winners were reported as `STOP_LOSS_HIT`, the same as the losers.
+
+Changes:
+- **Pause after a loss.** No new entry for `STRATEGY_LOSS_COOLDOWN_MINUTES` (15) after a position
+  closes at a loss. Read from today's closed positions, so it survives a restart.
+- **Breakeven stop.** Once the premium is up `STRATEGY_BREAKEVEN_TRIGGER_PCT` (10%) and the trail
+  is not yet active, the stop moves to entry + 1%.
+- **`TRAIL_STOP_HIT` exit reason** when the stop that fired was above the entry (trail or
+  breakeven). `STOP_LOSS_HIT` now means a real loss. The dashboard shows it as "Trail Stop".
+- **Backtest premium model.** Black-Scholes on the ATM strike with the real weekly expiry (Tuesday,
+  the session before when Tuesday is a holiday, the next expiry on expiry day) and IV = 0.94 ×
+  India VIX. Calibrated on the 41 real paper trades in the DB: entry premium median error 0%
+  (p10 −9%, p90 +20%) against −20% (p10 −40%, p90 +60%) for the old 0.45%-of-spot model. The
+  backtest reproduces all 10 real trades of 21–23 Oct at the same minute, side and strike.
+
+Backtest: 200 sessions, 1 Jan – 23 Oct 2026, 1 lot of 65, ₹60 charges per trade, prod `.env`:
+
+| | Trades | Win % | Net | Profit factor | Max drawdown | Jan–Jun | Jul–Oct | Positive months |
+|---|---|---|---|---|---|---|---|---|
+| v2.0 | 477 | 39% | +₹11,954 | 1.04 | ₹31,324 | +₹4,480 | +₹7,474 | 5 / 10 |
+| v2.0 + pause only | 421 | 40% | +₹27,242 | 1.11 | ₹26,559 | +₹16,971 | +₹10,271 | 5 / 10 |
+| v2.0 + breakeven only | 535 | 48% | +₹19,058 | 1.08 | ₹16,693 | +₹12,706 | +₹6,352 | 5 / 10 |
+| **v2.1** | 481 | **49%** | **+₹32,909** | **1.15** | **₹18,358** | **+₹24,539** | **+₹8,370** | **7 / 10** |
+
+Day by day, v2.1 beats v2.0 on 72 days and trails it on 45 (paired t = 1.54): likely better, not
+proven. A pause of 10, 15, 20 or 30 minutes each beat v2.0 in both halves. 21–23 Oct: v2.0
+−₹4,661, v2.1 −₹2,858. Replaying the 41 real trades on their real 5-second option prices:
+v2.0 −₹1,421, v2.1 +₹444.
+Cost of the breakeven stop: it sometimes stops a trade that later wins (#32 on 21 Oct: +₹51
+instead of +₹1,458).
+
+Tested and rejected (worse overall or in one half):
+- A daily loss cap that also counts the next trade's stop-loss risk: −₹3,668, larger drawdown.
+- Locking +12% profit when the trail starts: −₹2,773.
+- A chase guard (no CALL above the upper Bollinger band or with Stochastic turning down, and the
+  mirror for PUTs): −₹6,651, worst drawdown ₹43,109.
+- No entries before 09:45 or 10:00: better in Jan–Jun, worse in Jul–Oct.
+- Target 30% or 25% instead of 40%: within noise.
+- Supertrend entries only at ADX ≥ 25: +₹5,890 on top of v2.1 and better in both halves, but
+  ADX ≥ 28 loses ₹14,802, so the gain may be luck. Next candidate once v2.1 has 10 days of
+  live data.
 
 ---
 

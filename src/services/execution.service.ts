@@ -591,6 +591,15 @@ class ExecutionService {
         slUpdated = true;
         position.stopLossPrice = newSl;
       }
+    } else if (env.strategyBreakevenTriggerPct > 0 && pnlPct >= env.strategyBreakevenTriggerPct) {
+      // Breakeven: a trade that was up this much must not turn into a full stop-loss loss
+      newSl = position.side === 'BUY'
+        ? Math.max(Number(position.stopLossPrice), entryPrice * 1.01)
+        : Math.min(Number(position.stopLossPrice), entryPrice * 0.99);
+      if (newSl !== Number(position.stopLossPrice)) {
+        slUpdated = true;
+        position.stopLossPrice = newSl;
+      }
     }
 
     // Exit checks FIRST — act on this exact price before any slower bookkeeping
@@ -602,8 +611,13 @@ class ExecutionService {
       ? ltp >= Number(position.targetPrice)
       : ltp <= Number(position.targetPrice);
 
+    // A stop that was moved past the entry (trail / breakeven) protects profit: report it separately
+    const stopInProfit = position.side === 'BUY'
+      ? Number(position.stopLossPrice) > entryPrice
+      : Number(position.stopLossPrice) < entryPrice;
+
     const exitReason = stopHit
-      ? 'STOP_LOSS_HIT'
+      ? (stopInProfit ? 'TRAIL_STOP_HIT' : 'STOP_LOSS_HIT')
       : targetHit || pnlPct >= env.strategyProfitTargetPct
         ? 'TARGET_HIT'
         : null;
@@ -680,7 +694,7 @@ class ExecutionService {
         stopLossPrice: Number(position.stopLossPrice),
         pnl: unrealizedPnl,
         pnlPct,
-        reason: `Trailing SL moved to ${Number(position.stopLossPrice).toFixed(1)}`,
+        reason: `${position.trailActive ? 'Trailing' : 'Breakeven'} SL moved to ${Number(position.stopLossPrice).toFixed(1)}`,
       });
     }
 

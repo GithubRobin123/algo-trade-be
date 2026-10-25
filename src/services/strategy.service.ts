@@ -87,7 +87,9 @@ const strategyStamp = (): { strategyVersion: string; strategyParams: Record<stri
     trailActivationPct: env.strategyTrailActivationPct,
     trailOffsetPct: env.strategyTrailOffsetPct,
     trailAtrMultiplier: env.strategyTrailAtrMultiplier,
+    breakevenTriggerPct: env.strategyBreakevenTriggerPct,
     cooldownMinutes: SIGNAL_COOLDOWN_MS / 60000,
+    lossCooldownMinutes: env.strategyLossCooldownMinutes,
     maxTradesPerDay: env.strategyMaxAutoTradesPerDay,
   },
 });
@@ -229,6 +231,13 @@ class StrategyService {
     if (isInCooldown(sym)) {
       await logDecision({ underlying: sym, decision: 'REJECTED', rejectionCategory: 'OTHER', rejectionReason: `Signal cooldown active (${SIGNAL_COOLDOWN_MS / 1000}s between signals)`, latencyMs: Date.now() - cycleStart });
       return { signal: null, intentId: null, logId: null, decisionSource: 'cooldown', strategyName: null };
+    }
+    // The signal cooldown counts from the previous entry, which a stopped-out trade has usually
+    // outlived: on 23 Oct new trades opened 1–13 s after a stop loss, into the same move.
+    const lossCooldownMs = env.strategyLossCooldownMinutes * 60 * 1000;
+    if (lossCooldownMs > 0 && risk.lastLossAt && Date.now() - risk.lastLossAt.getTime() < lossCooldownMs) {
+      await logDecision({ underlying: sym, decision: 'REJECTED', rejectionCategory: 'RISK_BLOCKED', rejectionReason: `Pause after a losing exit (${env.strategyLossCooldownMinutes} min from ${risk.lastLossAt.toISOString()})`, latencyMs: Date.now() - cycleStart });
+      return { signal: null, intentId: null, logId: null, decisionSource: 'loss-cooldown', strategyName: null };
     }
 
     // 4. Time filter
@@ -539,9 +548,15 @@ class StrategyService {
     const dailyPnl = realizedPnl + unrealizedPnl;
     const dailyLossLimit = -(env.strategyCapital * env.strategyDailyMaxLossPct) / 100;
 
-    if (tradeCountToday >= env.strategyMaxAutoTradesPerDay) return { tradeCountToday, dailyPnl, dailyLossLimit, blocked: true, blockReason: `Max trades reached (${env.strategyMaxAutoTradesPerDay}/day).` };
-    if (dailyPnl <= dailyLossLimit) return { tradeCountToday, dailyPnl, dailyLossLimit, blocked: true, blockReason: `Daily loss limit reached (realized + unrealized = ₹${dailyPnl.toFixed(0)}).` };
-    return { tradeCountToday, dailyPnl, dailyLossLimit, blocked: false, blockReason: null };
+    // Closing a position is its last update, so updatedAt is the exit time
+    const lastLossAt = closedPositions
+      .filter((pos) => pos.realizedPnl !== null && Number(pos.realizedPnl) < 0)
+      .reduce<Date | null>((latest, pos) => (!latest || pos.updatedAt > latest ? pos.updatedAt : latest), null);
+
+    const snapshot = { tradeCountToday, dailyPnl, dailyLossLimit, lastLossAt };
+    if (tradeCountToday >= env.strategyMaxAutoTradesPerDay) return { ...snapshot, blocked: true, blockReason: `Max trades reached (${env.strategyMaxAutoTradesPerDay}/day).` };
+    if (dailyPnl <= dailyLossLimit) return { ...snapshot, blocked: true, blockReason: `Daily loss limit reached (realized + unrealized = ₹${dailyPnl.toFixed(0)}).` };
+    return { ...snapshot, blocked: false, blockReason: null };
   }
 }
 

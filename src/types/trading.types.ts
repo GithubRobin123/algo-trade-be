@@ -48,6 +48,8 @@ export interface StrategyRiskSnapshot {
   tradeCountToday: number;
   dailyPnl: number;
   dailyLossLimit: number;
+  /** When today's most recent losing position was closed (drives the pause after a loss) */
+  lastLossAt: Date | null;
   blocked: boolean;
   blockReason: string | null;
 }
