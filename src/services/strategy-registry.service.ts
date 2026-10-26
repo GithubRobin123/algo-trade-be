@@ -72,7 +72,7 @@ function closePrices(ctx: StrategyContext): number[] {
 }
 
 /** Session VWAP from today's candles (typical price = (H+L+C)/3). Resets at 9:15 AM IST. */
-function sessionVwap(ctx: StrategyContext): number {
+export function sessionVwap(ctx: StrategyContext): number {
   if (!ctx.sessionCandles.length) return ctx.lastPrice;
   const sumTP = ctx.sessionCandles.reduce((s, c) => s + (Number(c.high) + Number(c.low) + Number(c.close)) / 3, 0);
   return sumTP / ctx.sessionCandles.length;
@@ -522,6 +522,7 @@ const bollingerBreakoutStrategy: StrategyPlugin = {
 
     const atrVal = atr(prices, 14);
     const sl = atrStopLoss(optionLtp, atrVal);
+    const vwapVal = sessionVwap(ctx);
 
     return {
       source: 'BOLLINGER_BREAKOUT' as StrategySource, side: 'BUY',
@@ -534,7 +535,7 @@ const bollingerBreakoutStrategy: StrategyPlugin = {
         underlying, bullish, pcr, strike: atmStrike, expiryDate, indexLtp: lastPrice,
         bbUpper: bb.upper, bbMiddle: bb.middle, bbLower: bb.lower,
         bbBandwidth: bb.bandwidth, bbPercentB: bb.percentB, signalType,
-        rsi14, ema9: ema9Val, ema21: ema21Val, atr: atrVal, timeIST, minutesToClose,
+        rsi14, ema9: ema9Val, ema21: ema21Val, vwap: vwapVal, atr: atrVal, timeIST, minutesToClose,
         dayHigh: ctx.dayHigh, dayLow: ctx.dayLow, prevDayClose: ctx.prevDayClose,
         atmCallOI: ctx.atmCallOi, atmPutOI: ctx.atmPutOi,
         ivPercentile: ctx.atmIv ?? 40, strategyName: 'BOLLINGER_BREAKOUT',

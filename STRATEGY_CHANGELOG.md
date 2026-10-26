@@ -20,6 +20,32 @@ Rules for changes:
 
 ---
 
+## v2.1.1 (2026-10-26)
+
+Bug fix. `BOLLINGER_BREAKOUT` did not put `vwap` in its signal metadata, and the rules gate then
+used the index price as VWAP. "Price above VWAP" could never be true, so every Bollinger signal got
++25 bear and no VWAP bull points, whatever the real VWAP was (live on 26 Oct 10:00: "Price below
+VWAP (22638)" with NIFTY at 22638 and the session VWAP near 22540).
+
+Changes:
+- `BOLLINGER_BREAKOUT` reports the session VWAP like the other plugins.
+- The rules gate computes the session VWAP when a plugin does not report one, instead of using
+  the index price.
+
+Backtest, same candles and settings as v2.1 (200 sessions, 1 Jan – 23 Oct 2026):
+
+| | Trades | Win % | Net | Profit factor | Max drawdown | Jan–Jun | Jul–Oct | Positive months |
+|---|---|---|---|---|---|---|---|---|
+| v2.1 | 481 | 49.1% | +₹32,909 | 1.15 | ₹18,358 | +₹24,539 | +₹8,370 | 7 / 10 |
+| v2.1.1 | 472 | 49.4% | +₹37,810 | 1.18 | ₹14,888 | +₹29,751 | +₹8,059 | 6 / 10 |
+
+The fake bear points had been letting Bollinger PUTs through: 13 of the 14 (+₹7,116 together) are
+now rejected. Supertrend PUTs take their place (+₹12,111 more). No Bollinger CALL passes in
+either version. 12 days change, 8 better and 4 worse (paired t = 0.85): about the same, not
+proven better. Jan–Jun +₹5,212, Jul–Oct flat (−₹311). Kept because it is a correctness fix.
+
+---
+
 ## v2.1 (2026-10-24)
 
 Why: in the week of 21–23 Oct v2.0 made 10 trades, 3 winners, −₹5,385 gross. No target was hit.

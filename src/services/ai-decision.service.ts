@@ -20,6 +20,7 @@ import {
   ema,
   macd,
   rsi,
+  sessionVwap,
   stochastic,
   supertrend,
 } from './strategy-registry.service';
@@ -468,7 +469,8 @@ export function buildRuleParams(
     macd: (meta.macd as number) ?? macdVals?.macdLine ?? 0,
     macdSignal: (meta.macdSignal as number) ?? macdVals?.signalLine ?? 0,
     macdHistogram: (meta.macdHistogram as number) ?? macdVals?.histogram ?? 0,
-    vwap: (meta.vwap as number) ?? (indexPrice ?? 0),
+    // Falling back to the index price scored every such signal as "below VWAP" (+25 bear)
+    vwap: (meta.vwap as number) ?? sessionVwap(ctx),
     volumeRatio: (meta.volumeRatio as number) ?? 1,
     dayHigh: ctx.dayHigh,
     dayLow: ctx.dayLow,

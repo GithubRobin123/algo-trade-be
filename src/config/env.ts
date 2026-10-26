@@ -119,7 +119,7 @@ export const env = {
   strategyWarmupSessions: getNumber('STRATEGY_WARMUP_SESSIONS', 2),
   // Stamped on every decision, intent and position so results can be compared per version.
   // Bump it in code whenever entry/exit logic changes (env parameters are stamped separately).
-  strategyVersion: 'v2.1',
+  strategyVersion: 'v2.1.1',
   // How long a strategy intent waits for manual approval before it expires
   intentExpiryMinutes: getNumber('INTENT_EXPIRY_MINUTES', 2),
 
