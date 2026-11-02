@@ -21,6 +21,7 @@
  */
 
 import { Op, col, where as sqlWhere } from 'sequelize';
+import { buildInfo } from '../config/build-info';
 import { env } from '../config/env';
 import { ApiError } from '../middleware/error.middleware';
 import { StrategyDecisionLog, RejectionCategory } from '../models/strategy-decision-log.model';
@@ -28,6 +29,7 @@ import { StrategyPosition } from '../models/strategy-position.model';
 import { PositionPnlTick } from '../models/position-pnl-tick.model';
 import { TradeIntent } from '../models/trade-intent.model';
 import { StrategyRiskSnapshot, StrategySignal } from '../types/trading.types';
+import { istClock } from '../utils/ist-clock';
 import { AiDecisionResult, getAiTradeDecision, selectByRules } from './ai-decision.service';
 import { executionService } from './execution.service';
 import { historicalCandleService } from './historical-candle.service';
@@ -47,12 +49,10 @@ const startOfDay = (): Date => {
 const sameDayIso = (): string => new Date().toISOString().slice(0, 10);
 
 const getIstTime = (): { timeIST: string; minutesToClose: number; minutesSinceOpen: number } => {
-  const now = new Date();
-  const ist = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit', minute: '2-digit' });
-  const [h, m] = ist.split(':').map(Number);
-  const minutesToClose = Math.max(0, (15 * 60 + 15) - (h * 60 + m));
-  const minutesSinceOpen = (h - 9) * 60 + (m - 15);
-  return { timeIST: ist, minutesToClose, minutesSinceOpen };
+  const { time, minutes } = istClock();
+  const minutesToClose = Math.max(0, (15 * 60 + 15) - minutes);
+  const minutesSinceOpen = minutes - (9 * 60 + 15);
+  return { timeIST: time, minutesToClose, minutesSinceOpen };
 };
 
 // ── Signal cooldown: prevents burst entries from the same repeated signal ──
@@ -73,9 +73,10 @@ function recordSignal(sym: string): void {
 // Minimum warm-up + session candles before any strategy runs (the longest plugin needs 40)
 const MIN_STRATEGY_CANDLES = 40;
 
-/** Version + the parameters that shape entries/exits, stamped on every decision and trade. */
-const strategyStamp = (): { strategyVersion: string; strategyParams: Record<string, number | boolean> } => ({
+/** Version, deployed commit and the parameters that shape entries/exits, stamped on every decision and trade. */
+const strategyStamp = (): { strategyVersion: string; buildCommit: string | null; strategyParams: Record<string, number | boolean> } => ({
   strategyVersion: env.strategyVersion,
+  buildCommit: buildInfo?.commit ?? null,
   strategyParams: {
     confidenceThreshold: env.strategyConfidenceThreshold,
     rulesGate: env.strategyRulesGateEnabled,
@@ -91,6 +92,9 @@ const strategyStamp = (): { strategyVersion: string; strategyParams: Record<stri
     cooldownMinutes: SIGNAL_COOLDOWN_MS / 60000,
     lossCooldownMinutes: env.strategyLossCooldownMinutes,
     maxTradesPerDay: env.strategyMaxAutoTradesPerDay,
+    maxLossesPerDay: env.strategyMaxLossesPerDay,
+    dailyMaxLossPct: env.strategyDailyMaxLossPct,
+    dailyLossIncludesNextRisk: env.strategyDailyLossIncludesNextRisk,
   },
 });
 
@@ -392,6 +396,16 @@ class StrategyService {
       return { signal, intentId: null, logId: null, decisionSource: 'confidence-gate', strategyName };
     }
 
+    // 8b. Daily loss limit including this trade's planned stop-loss loss. The realized-only check
+    // let a third loser take 28 Oct to −₹3,920 against a ₹3,000 limit.
+    if (env.strategyDailyLossIncludesNextRisk) {
+      const plannedLoss = Math.max(0, signal.entryPrice - signal.suggestedStopLoss) * signal.quantity;
+      if (risk.dailyPnl - plannedLoss <= risk.dailyLossLimit) {
+        await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'RISK_BLOCKED', rejectionReason: `Daily loss limit: today ₹${risk.dailyPnl.toFixed(0)} − this trade's planned loss ₹${plannedLoss.toFixed(0)} would pass ₹${risk.dailyLossLimit.toFixed(0)}`, confidence: signal.confidence, signalSource: signal.source, rationale: signal.rationale, latencyMs: Date.now() - cycleStart });
+        return { signal, intentId: null, logId: null, decisionSource: 'risk-gate', strategyName };
+      }
+    }
+
     // 9. AI decision
     let aiLatencyMs: number | null = null;
     let finalConfidence = signal.confidence;
@@ -549,13 +563,17 @@ class StrategyService {
     const dailyLossLimit = -(env.strategyCapital * env.strategyDailyMaxLossPct) / 100;
 
     // Closing a position is its last update, so updatedAt is the exit time
-    const lastLossAt = closedPositions
-      .filter((pos) => pos.realizedPnl !== null && Number(pos.realizedPnl) < 0)
+    const losingPositions = closedPositions.filter((pos) => pos.realizedPnl !== null && Number(pos.realizedPnl) < 0);
+    const lastLossAt = losingPositions
       .reduce<Date | null>((latest, pos) => (!latest || pos.updatedAt > latest ? pos.updatedAt : latest), null);
+    const lossesToday = losingPositions.length;
 
-    const snapshot = { tradeCountToday, dailyPnl, dailyLossLimit, lastLossAt };
+    const snapshot = { tradeCountToday, dailyPnl, dailyLossLimit, lastLossAt, lossesToday };
     if (tradeCountToday >= env.strategyMaxAutoTradesPerDay) return { ...snapshot, blocked: true, blockReason: `Max trades reached (${env.strategyMaxAutoTradesPerDay}/day).` };
     if (dailyPnl <= dailyLossLimit) return { ...snapshot, blocked: true, blockReason: `Daily loss limit reached (realized + unrealized = ₹${dailyPnl.toFixed(0)}).` };
+    if (env.strategyMaxLossesPerDay > 0 && lossesToday >= env.strategyMaxLossesPerDay) {
+      return { ...snapshot, blocked: true, blockReason: `${lossesToday} losing trades today (max ${env.strategyMaxLossesPerDay}).` };
+    }
     return { ...snapshot, blocked: false, blockReason: null };
   }
 }

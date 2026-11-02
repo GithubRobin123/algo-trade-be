@@ -97,17 +97,22 @@ export const env = {
   strategyScanIntervalMs: getNumber('STRATEGY_SCAN_INTERVAL_MS', 20000),
   strategyMaxAutoTradesPerDay: getNumber('STRATEGY_MAX_AUTO_TRADES_PER_DAY', 2),
   strategyDailyMaxLossPct: getNumber('STRATEGY_DAILY_MAX_LOSS_PCT', 5),
+  // true = the daily loss limit also counts the next trade's planned stop-loss loss, so a new
+  // trade can never take the day past the limit (false = only realized + open P&L, as before v2.2)
+  strategyDailyLossIncludesNextRisk: getBoolean('STRATEGY_DAILY_LOSS_INCLUDES_NEXT_RISK', true),
+  // No new entry after this many losing trades in a day (0 = off)
+  strategyMaxLossesPerDay: getNumber('STRATEGY_MAX_LOSSES_PER_DAY', 3),
   strategyCapital: getNumber('STRATEGY_CAPITAL', 100000),
   strategyProfitTargetPct: getNumber('STRATEGY_PROFIT_TARGET_PCT', 50),
   strategyEntryStopLossPct: getNumber('STRATEGY_ENTRY_STOP_LOSS_PCT', 20),
   strategyTrailActivationPct: getNumber('STRATEGY_TRAIL_ACTIVATION_PCT', 8),
-  strategyTrailOffsetPct: getNumber('STRATEGY_TRAIL_OFFSET_PCT', 3),
+  strategyTrailOffsetPct: getNumber('STRATEGY_TRAIL_OFFSET_PCT', 5),
   strategyConfidenceThreshold: getNumber('STRATEGY_CONFIDENCE_THRESHOLD', 0.7),
   // Rule-based scorer blocks SKIP / opposite-direction signals whenever no AI call will run
   strategyRulesGateEnabled: getBoolean('STRATEGY_RULES_GATE_ENABLED', true),
   // ATR stop loss on option premium: clamp(multiplier × ATM-delta × indexATR ÷ premium, min%, max%)
   strategySlAtrMultiplier: getNumber('STRATEGY_SL_ATR_MULTIPLIER', 2.5),
-  strategySlMinPct: getNumber('STRATEGY_SL_MIN_PCT', 10),
+  strategySlMinPct: getNumber('STRATEGY_SL_MIN_PCT', 8),
   strategySlMaxPct: getNumber('STRATEGY_SL_MAX_PCT', 30),
   // Trailing stop distance = max(TRAIL_OFFSET_PCT of best premium, multiplier × ATM-delta × entry index ATR)
   strategyTrailAtrMultiplier: getNumber('STRATEGY_TRAIL_ATR_MULTIPLIER', 1.5),
@@ -119,7 +124,7 @@ export const env = {
   strategyWarmupSessions: getNumber('STRATEGY_WARMUP_SESSIONS', 2),
   // Stamped on every decision, intent and position so results can be compared per version.
   // Bump it in code whenever entry/exit logic changes (env parameters are stamped separately).
-  strategyVersion: 'v2.1.1',
+  strategyVersion: 'v2.2',
   // How long a strategy intent waits for manual approval before it expires
   intentExpiryMinutes: getNumber('INTENT_EXPIRY_MINUTES', 2),
 

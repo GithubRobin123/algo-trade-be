@@ -20,6 +20,71 @@ Rules for changes:
 
 ---
 
+## v2.2 (2026-11-03)
+
+Why: three losing weeks in a row (12–30 Oct), and a review of all 59 paper trades (3 Jul – 2 Nov).
+The backtest reproduces the live trades, so the losses come from the strategy, not from execution.
+Over 1 Jan – 30 Oct the backtest has the same strategy mix as live (Supertrend ≈ 93% of trades):
+Supertrend PUTs +₹52,009, Supertrend CALLs −₹17,594. The leak is the CALL side, not Supertrend.
+
+Changes:
+- **Stop loss minimum 8%** (`STRATEGY_SL_MIN_PCT`, was 10). Losers almost never recover from −8%:
+  on real ticks the live winners #32, #35, #38, #43, #49, #51 dipped at most −5.9% and #55–#58
+  (2 Nov) at most −5.6% before turning green.
+- **Trailing distance 5%** (`STRATEGY_TRAIL_OFFSET_PCT`, production `.env` had 6).
+- **No new entry after 3 losing trades in a day** (`STRATEGY_MAX_LOSSES_PER_DAY`, 0 = off).
+- **The daily loss limit counts the next trade's planned loss** (`STRATEGY_DAILY_LOSS_INCLUDES_NEXT_RISK`).
+  It only checked realized + open P&L, so a trade could start just inside the limit and end past
+  it: 28 Oct closed at −₹3,920 against a ₹3,000 limit; the backtest's worst day was −₹4,330.
+- **`BREAKEVEN_STOP_HIT` exit reason** for a stop at entry + 1% before the trail started (#56, #58
+  were reported as `TRAIL_STOP_HIT` with the trail inactive). Dashboard label "Breakeven".
+- **Bug: the 15:10 square-off ran at midnight.** `toLocaleTimeString('en-IN', { hour12: false })`
+  returns "24:05" between 00:00 and 00:59, so the sweep fired at 00:00 and marked the day done;
+  #24 (24 Jul) and #50 (29 Oct) were closed at 00:00 the next day. IST time now comes from UTC
+  arithmetic (`utils/ist-clock.ts`) everywhere.
+- **Bug: a failed square-off was never retried.** The day was marked done before the sweep, and the
+  "force close" fallback could not run because `closePositionWithEvent` catches its own errors
+  (#26, 29 Jul, DB outage at 15:10, closed by hand at 16:10). Now the sweep repeats every 30 s
+  until no position is open, and a position is never marked closed without an exit order.
+- `/api/trades/history` returns `strategyVersion`, `buildCommit`, `initialStopLossPct` (the
+  position's `stopLossPrice` is the final, moved stop) and ADX / RSI / ATR at entry. Every trade
+  is stamped with the deployed commit.
+
+Production `.env` for v2.2: `STRATEGY_TRAIL_OFFSET_PCT=5`, `STRATEGY_DAILY_MAX_LOSS_PCT=3.5`
+(`STRATEGY_SL_MIN_PCT` is not set there, so the new default 8 applies).
+
+Backtest: 205 sessions, 1 Jan – 30 Oct 2026, same candles, 1 lot of 65, ₹60 charges per trade:
+
+| | Trades | Net | Profit factor | Max drawdown | Jan–Apr | May–Jul | Aug–Oct | Worst day | Worst week | Losing weeks |
+|---|---|---|---|---|---|---|---|---|---|---|
+| v2.1.1 (production settings) | 483 | +₹34,797 | 1.16 | ₹14,888 | +₹35,101 | −₹5,647 | +₹5,342 | −₹4,330 | −₹6,140 | 23 / 44 |
+| v2.2, `.env` unchanged | 470 | +₹47,124 | 1.25 | ₹11,480 | +₹35,976 | −₹44 | +₹11,192 | −₹2,758 | −₹9,121 | 23 / 44 |
+| **v2.2 + trail 5% + limit 3.5%** | 478 | **+₹64,716** | **1.34** | **₹12,458** | **+₹52,847** | **+₹652** | **+₹11,218** | **−₹3,445** | **−₹4,750** | **20 / 44** |
+
+Day by day the last row beats v2.1.1 on 106 days and trails it on 16 (paired t = 3.09).
+With the switches off, the v2.2 build reproduces v2.1.1 exactly (483 trades, +₹34,797).
+Nearby values: stop minimum 7% / 9% → +₹62,065 / +₹57,844 (with max 3 losses); trail 4% / 6% →
++₹59,438 / +₹56,309; max losing trades 2 / 4 → −₹1,947 / +₹1,204 against no limit; a hard limit
+of 3% → +₹50,458 (worst day −₹2,758, but worst week −₹9,121), 4% → never binds.
+12–30 Oct stays negative: v2.2 −₹6,513, v2.1.1 −₹7,579. Only the rejected gap-free ADX below
+turned it positive.
+
+Tested and rejected, each on top of stop 8% / trail 5% (+₹56,714):
+- ATR without the overnight gap (stops and trail after a gap open were ~2× wider, #55 on 2 Nov
+  gave back +30% → +8%): −₹8,301, worse in Jan–Apr and May–Jul. The wide post-gap stops help more
+  often than they hurt.
+- ADX without the overnight gap: −₹24,191 overall, but Aug–Oct +₹11,730 and 12–30 Oct +₹17,407.
+  Strongly regime-dependent — watch it, do not adopt.
+- No entry more than 3 / 4 / 5 ATR past EMA21: −₹52,501 / −₹27,206 / −₹20,602.
+- 15-minute Supertrend must agree: −₹12,197.
+- Supertrend only while ADX is rising: −₹4,535 (May–Jul −₹11,498).
+- Daily trend filter (last close vs 10 / 20-day EMA): −₹22,210 / −₹18,616. It blocks CALLs in a
+  falling year but costs more PUT profit than it saves.
+- Pause after a small win (exit below +3% / +5%): −₹29,134.
+- Technical-reversal exits from +5% / +10% (v1 took profits early): −₹143 / −₹659.
+
+---
+
 ## v2.1.1 (2026-10-26)
 
 Bug fix. `BOLLINGER_BREAKOUT` did not put `vwap` in its signal metadata, and the rules gate then

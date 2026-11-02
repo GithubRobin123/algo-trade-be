@@ -6,8 +6,9 @@
  *
  * Mirrors the live engine at 1-minute resolution (live scans every 20 s): entries are evaluated at
  * every 1-minute close on COMPLETED 5-minute candles with the same warm-up, plugins, rules gate,
- * entry window (09:30–14:35 IST), 5-minute cooldown, pause after a loss, daily loss cap and
- * one-position limit. Exits replay the stop loss, breakeven, target, trailing stop,
+ * entry window (09:30–14:35 IST), 5-minute cooldown, pause after a loss, daily loss cap (with the
+ * next trade's planned loss), max losing trades per day and one-position limit. Exits replay the
+ * stop loss, breakeven, target, trailing stop,
  * technical-reversal and 15:10 square-off rules on 1-minute bars.
  *
  * The option premium is MODELLED with Black-Scholes on the ATM strike: the weekly expiry (Tuesday
@@ -302,6 +303,7 @@ function runVariant(variant: Variant, market: Market): Trade[] {
       let lastSignalAt = 0;
       let lastLossAt = 0;
       let tradesToday = 0;
+      let lossesToday = 0;
       let dayPnl = 0;
 
       const premiumAt = (p: OpenPosition, index: number, at: number): number =>
@@ -310,9 +312,10 @@ function runVariant(variant: Variant, market: Market): Trade[] {
       const close = (p: OpenPosition, at: number, index: number, premium: number, reason: string): void => {
         const pnl = (premium - p.premiumEntry) * LOT_SIZE - CHARGES_PER_ROUND_TRIP;
         dayPnl += pnl;
-        if (premium < p.premiumEntry) lastLossAt = at; // live pauses on a gross loss (realizedPnl < 0)
-        // A stop that was moved past the entry (trail / breakeven) is reported as a trail stop, as live
-        const label = reason === 'STOP_LOSS_HIT' && p.stopLoss > p.premiumEntry ? 'TRAIL_STOP_HIT' : reason;
+        if (premium < p.premiumEntry) { lastLossAt = at; lossesToday += 1; } // live counts gross losses (realizedPnl < 0)
+        // A stop that was moved past the entry is reported as a trail or breakeven stop, as live
+        const label = reason === 'STOP_LOSS_HIT' && p.stopLoss > p.premiumEntry
+          ? (p.trailActive ? 'TRAIL_STOP_HIT' : 'BREAKEVEN_STOP_HIT') : reason;
         trades.push({
           day, entryTime: istClock(p.entryTime), exitTime: istClock(at), strategy: p.strategy, side: p.side,
           strike: p.strike, expiry: p.expiry, indexEntry: p.indexEntry, indexExit: index,
@@ -373,9 +376,12 @@ function runVariant(variant: Variant, market: Market): Trade[] {
         if (position || minutesSinceOpen < 15 || minutesToClose < 40) continue;
         if (tradesToday >= env.strategyMaxAutoTradesPerDay || dayPnl <= dailyLossLimit || now - lastSignalAt < COOLDOWN_MS) continue;
         if (lossCooldownMs > 0 && lastLossAt && now - lastLossAt < lossCooldownMs) continue;
+        if (env.strategyMaxLossesPerDay > 0 && lossesToday >= env.strategyMaxLossesPerDay) continue;
 
         const signal = entrySignal(market, day, warm, five, bar, now);
         if (!signal) continue;
+        const plannedLoss = (signal.premium - signal.stopLoss) * LOT_SIZE + CHARGES_PER_ROUND_TRIP;
+        if (env.strategyDailyLossIncludesNextRisk && dayPnl - plannedLoss <= dailyLossLimit) continue;
 
         lastSignalAt = now;
         tradesToday += 1;
@@ -421,13 +427,16 @@ function summarise(trades: Trade[]): Record<string, unknown> {
   };
 }
 
-// v2.0 = the rules before v2.1; each v2.1 change alone, then the code defaults (v2.1 + .env)
-const V20: Variant['env'] = { strategyBreakevenTriggerPct: 0, strategyLossCooldownMinutes: 0 };
+// v2.1.1 = the rules and production settings before v2.2; each v2.2 change alone, then the code defaults (v2.2 + .env)
+const V211: Variant['env'] = {
+  strategySlMinPct: 10, strategyTrailOffsetPct: 6, strategyMaxLossesPerDay: 0, strategyDailyLossIncludesNextRisk: false,
+};
 const VARIANTS: Variant[] = [
-  { name: 'v2.0', env: V20 },
-  { name: 'v2.0 + pause after a loss', env: { ...V20, strategyLossCooldownMinutes: env.strategyLossCooldownMinutes } },
-  { name: 'v2.0 + breakeven stop', env: { ...V20, strategyBreakevenTriggerPct: env.strategyBreakevenTriggerPct } },
-  { name: 'v2.1 (code defaults)', env: {} },
+  { name: 'v2.1.1', env: V211 },
+  { name: 'v2.1.1 + stop min 8%, trail 5%', env: { ...V211, strategySlMinPct: 8, strategyTrailOffsetPct: 5 } },
+  { name: 'v2.1.1 + max 3 losing trades', env: { ...V211, strategyMaxLossesPerDay: 3 } },
+  { name: 'v2.1.1 + loss limit incl. next trade', env: { ...V211, strategyDailyLossIncludesNextRisk: true } },
+  { name: 'v2.2 (code defaults)', env: {} },
 ];
 
 async function main(): Promise<void> {

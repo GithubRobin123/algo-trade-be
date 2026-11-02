@@ -8,6 +8,7 @@ import {
   NormalizedOptionChain,
   NormalizedOptionChainRow,
 } from '../types/upstox.types';
+import { istClock } from '../utils/ist-clock';
 import { candleAggregator, sessionStart } from './candle-aggregator.service';
 import { tokenService } from './token.service';
 import { underlyingService } from './underlying.service';
@@ -16,22 +17,9 @@ import { websocketService } from './websocket.service';
 
 // Returns true during NSE regular session: Mon–Fri, 09:15–15:30 IST
 export function isMarketOpen(): boolean {
-  const now = new Date();
-  const ist = new Intl.DateTimeFormat('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    weekday: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).formatToParts(now);
-
-  const day = ist.find((p) => p.type === 'weekday')?.value ?? '';
-  const hour = parseInt(ist.find((p) => p.type === 'hour')?.value ?? '0', 10);
-  const min = parseInt(ist.find((p) => p.type === 'minute')?.value ?? '0', 10);
-  const totalMin = hour * 60 + min;
-
-  if (day === 'Sat' || day === 'Sun') return false;
-  return totalMin >= 555 && totalMin <= 930; // 9:15 (555) to 3:30 (930)
+  const { weekday, minutes } = istClock();
+  if (weekday === 0 || weekday === 6) return false;
+  return minutes >= 555 && minutes <= 930; // 9:15 (555) to 3:30 (930)
 }
 
 const toNumber = (value: unknown): number | null => {

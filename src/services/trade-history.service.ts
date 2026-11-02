@@ -29,6 +29,23 @@ export interface TradeHistoryEntry {
   indexPriceAtEntry: number | null;
   ruleSignals: string[] | null;
   decisionLogId: number | null;
+  /** Stamped on the trade at entry (null for trades before v2.0) */
+  strategyVersion: string | null;
+  buildCommit: string | null;
+  /** Planned stop loss as % below the signal premium (the position's stopLossPrice is the final, moved stop) */
+  initialStopLossPct: number | null;
+  adxAtEntry: number | null;
+  rsiAtEntry: number | null;
+  indexAtrAtEntry: number | null;
+}
+
+const numberOrNull = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+function initialStopLossPct(meta: Record<string, unknown> | null): number | null {
+  const entry = numberOrNull(meta?.entryPrice);
+  const stop = numberOrNull(meta?.stopLossPrice);
+  return entry && stop !== null ? ((entry - stop) / entry) * 100 : null;
 }
 
 export interface DecisionLogEntry {
@@ -177,6 +194,12 @@ class TradeHistoryService {
           decisionLog?.indexPrice != null ? Number(decisionLog.indexPrice) : null,
         ruleSignals,
         decisionLogId: decisionLog ? Number(decisionLog.id) : null,
+        strategyVersion: (posMeta?.strategyVersion as string | undefined) ?? null,
+        buildCommit: (posMeta?.buildCommit as string | undefined) ?? null,
+        initialStopLossPct: initialStopLossPct(posMeta),
+        adxAtEntry: numberOrNull(posMeta?.adx),
+        rsiAtEntry: numberOrNull(posMeta?.rsi14),
+        indexAtrAtEntry: numberOrNull(posMeta?.atr),
       };
     });
   }

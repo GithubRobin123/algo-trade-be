@@ -31,26 +31,15 @@ import { underlyingService } from './underlying.service';
 import { marketStreamService } from './market-stream.service';
 import { ATM_DELTA, adx, ema, rsi, macd, supertrend } from './strategy-registry.service';
 import { StrategyCandle, historicalCandleService } from './historical-candle.service';
+import { istClock } from '../utils/ist-clock';
 
 // ── EOD square-off time: 3:10 PM IST (5 min before market close) ──────────
 const EOD_SQUAREOFF_HOUR = 15;
 const EOD_SQUAREOFF_MINUTE = 10;
-
-function getIstHourMinute(): { h: number; m: number } {
-  const now = new Date();
-  const ist = now.toLocaleTimeString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    hour12: false,
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-  const [h, m] = ist.split(':').map(Number);
-  return { h, m };
-}
+const EOD_RETRY_GAP_MS = 30_000; // a sweep that left positions open is retried this often
 
 function isEodSquareOffTime(): boolean {
-  const { h, m } = getIstHourMinute();
-  return h > EOD_SQUAREOFF_HOUR || (h === EOD_SQUAREOFF_HOUR && m >= EOD_SQUAREOFF_MINUTE);
+  return istClock().minutes >= EOD_SQUAREOFF_HOUR * 60 + EOD_SQUAREOFF_MINUTE;
 }
 
 // ── Service ────────────────────────────────────────────────────────────────
@@ -75,6 +64,7 @@ class ExecutionService {
   // Using a date string instead of a boolean means the flag auto-resets every new trading day
   // without requiring a server restart — fixes the bug where positions stayed OPEN overnight.
   private eodSquareOffDate: string | null = null;
+  private lastEodAttemptAt = 0;
   // Consecutive monitor failures per instrumentKey and when to retry it next
   private monitorFailures = new Map<string, { count: number; retryAt: number }>();
   // Open positions shared by the 5s cycle and streamed ticks — one instance per position,
@@ -90,7 +80,7 @@ class ExecutionService {
   private liveFeedAttached = false;
 
   private getIstDateString(): string {
-    return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    return istClock().date;
   }
 
   private hasEodRunToday(): boolean {
@@ -359,10 +349,13 @@ class ExecutionService {
   // ── Main monitor cycle ────────────────────────────────────────────────
   private async runMonitorCycle(): Promise<void> {
     try {
-      // 1. EOD square-off check
+      // 1. EOD square-off: retried until no position is left open (no point checking SL/target after EOD)
       if (isEodSquareOffTime() && !this.hasEodRunToday()) {
-        await this.runEodSquareOff();
-        return; // No point checking SL/target after EOD
+        if (Date.now() - this.lastEodAttemptAt >= EOD_RETRY_GAP_MS) {
+          this.lastEodAttemptAt = Date.now();
+          await this.runEodSquareOff();
+        }
+        return;
       }
 
       // 2. Manage all open positions
@@ -378,14 +371,17 @@ class ExecutionService {
 
   // ── EOD square-off ────────────────────────────────────────────────────
   private async runEodSquareOff(): Promise<void> {
-    // Record the IST date so this only runs once per trading day even across midnight
-    this.eodSquareOffDate = this.getIstDateString();
-
+    // The day counts as done only once nothing is left open. It used to be marked done before
+    // the sweep, so a DB outage at 15:10 (29 Jul, #26) left the position open with no retry.
+    const today = this.getIstDateString();
     const openPositions = await StrategyPosition.findAll({
       where: { status: 'OPEN' },
     });
 
-    if (!openPositions.length) return;
+    if (!openPositions.length) {
+      this.eodSquareOffDate = today;
+      return;
+    }
 
     await tradeEventService.emit({
       type: 'EOD_SQUAREOFF_START',
@@ -394,57 +390,28 @@ class ExecutionService {
       metadata: { count: openPositions.length },
     });
 
-    let closedCount = 0;
-
+    // closePositionWithEvent reports its own failures (SYSTEM_ERROR) and leaves the position OPEN.
+    // A position is never marked closed without an exit order: with live orders that would hide
+    // a broker position that is still open.
     for (const pos of openPositions) {
-      try {
-        await this.closePositionWithEvent(
-          Number(pos.id),
-          'EOD_SQUAREOFF',
-          pos.symbol.split('-')[0] ?? pos.symbol,
-        );
-        closedCount++;
-      } catch (err) {
-        process.stderr.write('[EOD] Failed to close position ' + pos.id + ': ' + String(err) + '\n');
-
-        // If the broker/order call failed, force-close the DB record anyway so the position
-        // doesn't stay stuck as OPEN overnight (same pattern as emergency exit).
-        try {
-          const lastPrice = pos.currentPrice !== null ? Number(pos.currentPrice) : Number(pos.entryPrice);
-          const realizedPnl = pos.side === 'BUY'
-            ? (lastPrice - Number(pos.entryPrice)) * pos.quantity
-            : (Number(pos.entryPrice) - lastPrice) * pos.quantity;
-          pos.status = 'CLOSED';
-          pos.exitReason = 'EOD_SQUAREOFF_FORCED';
-          pos.realizedPnl = realizedPnl;
-          pos.unrealizedPnl = 0;
-          await pos.save();
-          websocketService.broadcast('position_update', {
-            id: Number(pos.id),
-            symbol: pos.symbol,
-            instrumentKey: pos.instrumentKey,
-            side: pos.side,
-            quantity: pos.quantity,
-            entryPrice: Number(pos.entryPrice),
-            currentPrice: lastPrice,
-            unrealizedPnl: 0,
-            unrealizedPnlPct: 0,
-            stopLossPrice: Number(pos.stopLossPrice),
-            targetPrice: Number(pos.targetPrice),
-            trailActive: pos.trailActive,
-            bestPrice: Number(pos.bestPrice),
-            status: 'CLOSED',
-          });
-          closedCount++;
-        } catch { /* DB also failed — nothing we can do */ }
-      }
+      await this.closePositionWithEvent(
+        Number(pos.id),
+        'EOD_SQUAREOFF',
+        pos.symbol.split('-')[0] ?? pos.symbol,
+      );
     }
+
+    const stillOpen = await StrategyPosition.count({ where: { status: 'OPEN' } });
+    if (stillOpen === 0) this.eodSquareOffDate = today;
+    const closedCount = openPositions.length - stillOpen;
 
     await tradeEventService.emit({
       type: 'EOD_SQUAREOFF_DONE',
       underlying: 'ALL',
-      reason: `EOD complete — closed ${closedCount}/${openPositions.length} positions`,
-      metadata: { closedCount, totalCount: openPositions.length },
+      reason: stillOpen === 0
+        ? `EOD complete — closed ${closedCount}/${openPositions.length} positions`
+        : `EOD incomplete — ${stillOpen} position(s) still open, retrying in ${EOD_RETRY_GAP_MS / 1000}s`,
+      metadata: { closedCount, totalCount: openPositions.length, stillOpen },
     });
   }
 
@@ -611,13 +578,14 @@ class ExecutionService {
       ? ltp >= Number(position.targetPrice)
       : ltp <= Number(position.targetPrice);
 
-    // A stop that was moved past the entry (trail / breakeven) protects profit: report it separately
+    // A stop that was moved past the entry protects profit: report it separately, as a trail stop
+    // or (trail not started yet) a breakeven stop
     const stopInProfit = position.side === 'BUY'
       ? Number(position.stopLossPrice) > entryPrice
       : Number(position.stopLossPrice) < entryPrice;
 
     const exitReason = stopHit
-      ? (stopInProfit ? 'TRAIL_STOP_HIT' : 'STOP_LOSS_HIT')
+      ? (stopInProfit ? (position.trailActive ? 'TRAIL_STOP_HIT' : 'BREAKEVEN_STOP_HIT') : 'STOP_LOSS_HIT')
       : targetHit || pnlPct >= env.strategyProfitTargetPct
         ? 'TARGET_HIT'
         : null;
