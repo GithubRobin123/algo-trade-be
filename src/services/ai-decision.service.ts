@@ -616,12 +616,15 @@ export function computeRuleBasedDecision(params: AiDecisionParams): RuleBasedRes
   }
 
   // ── PCR ─────────────────────────────────────────────────────────────
+  // Scored only when STRATEGY_GATE_PCR_ENABLED=true. The backtest has no PCR history, and live PCR
+  // jumps across the 0.8 cut-off between scans (0.72 ↔ 0.80 within a minute on 4 Nov), so the ±8
+  // flipped otherwise identical signals: the 14:11 CALL scored 69% (needs 70) only because of it.
   if (params.pcrRatio > 1.2) {
-    bullScore += 8;
-    signals.push(`High PCR ${params.pcrRatio.toFixed(2)} — bullish squeeze potential`);
+    if (env.strategyGatePcrEnabled) bullScore += 8;
+    signals.push(`High PCR ${params.pcrRatio.toFixed(2)} — bullish squeeze potential${env.strategyGatePcrEnabled ? '' : ' (not scored)'}`);
   } else if (params.pcrRatio < 0.8) {
-    bearScore += 8;
-    signals.push(`Low PCR ${params.pcrRatio.toFixed(2)} — bearish risk`);
+    if (env.strategyGatePcrEnabled) bearScore += 8;
+    signals.push(`Low PCR ${params.pcrRatio.toFixed(2)} — bearish risk${env.strategyGatePcrEnabled ? '' : ' (not scored)'}`);
   }
 
   // ── Supertrend ——————————————————————————————————————————————————————

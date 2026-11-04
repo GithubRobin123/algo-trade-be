@@ -80,6 +80,7 @@ const strategyStamp = (): { strategyVersion: string; buildCommit: string | null;
   strategyParams: {
     confidenceThreshold: env.strategyConfidenceThreshold,
     rulesGate: env.strategyRulesGateEnabled,
+    gatePcr: env.strategyGatePcrEnabled,
     minRuleProbabilityPct: env.aiMinProbabilityPct,
     slAtrMultiplier: env.strategySlAtrMultiplier,
     slMinPct: env.strategySlMinPct,

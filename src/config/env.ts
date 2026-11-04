@@ -110,6 +110,9 @@ export const env = {
   strategyConfidenceThreshold: getNumber('STRATEGY_CONFIDENCE_THRESHOLD', 0.7),
   // Rule-based scorer blocks SKIP / opposite-direction signals whenever no AI call will run
   strategyRulesGateEnabled: getBoolean('STRATEGY_RULES_GATE_ENABLED', true),
+  // Let PCR (put/call OI near ATM) add ±8 to the rules gate. Off by default: the backtest has no
+  // option-chain history (PCR is neutral there), so with PCR on, live ran an untested gate.
+  strategyGatePcrEnabled: getBoolean('STRATEGY_GATE_PCR_ENABLED', false),
   // ATR stop loss on option premium: clamp(multiplier × ATM-delta × indexATR ÷ premium, min%, max%)
   strategySlAtrMultiplier: getNumber('STRATEGY_SL_ATR_MULTIPLIER', 2.5),
   strategySlMinPct: getNumber('STRATEGY_SL_MIN_PCT', 8),
@@ -124,7 +127,7 @@ export const env = {
   strategyWarmupSessions: getNumber('STRATEGY_WARMUP_SESSIONS', 2),
   // Stamped on every decision, intent and position so results can be compared per version.
   // Bump it in code whenever entry/exit logic changes (env parameters are stamped separately).
-  strategyVersion: 'v2.2',
+  strategyVersion: 'v2.2.1',
   // How long a strategy intent waits for manual approval before it expires
   intentExpiryMinutes: getNumber('INTENT_EXPIRY_MINUTES', 2),
 

@@ -20,6 +20,26 @@ Rules for changes:
 
 ---
 
+## v2.2.1 (2026-11-04)
+
+Why: the rules gate added ±8 for PCR (put/call OI of ±10 strikes around ATM: < 0.8 → +8 bear,
+> 1.2 → +8 bull), but the backtest has no option-chain history and always used a neutral PCR, so live
+ran a gate that was never tested. Live PCR also jumps across the 0.8 cut-off between scans (0.72 ↔
+0.80 within a minute on 4 Nov), flipping otherwise identical signals:
+- 4 Nov 14:11 Supertrend CALL scored Bull 72 / Bear 18 = 69% (needs 70) only because of "Low PCR
+  0.78". Without it: 72 / 10 = 74% → BUY_CALL. Real 23900 CE from 153.1 reached +20% by 14:49.
+- 3 Nov 10:30–13:09: 121 of 505 rejected CALL scans would have passed without it (the backtest
+  says those would have lost ≈ ₹1,000 that day). Over the two days the effect was roughly a wash.
+
+Change:
+- PCR no longer scores in the rules gate unless `STRATEGY_GATE_PCR_ENABLED=true`. It is still listed
+  in the rule signals, marked "(not scored)".
+
+Backtest (1 Jan – 4 Nov, 208 sessions): unchanged at +₹65,115, PF 1.34, by construction — the live
+gate now matches the tested one, so live results can be compared with the backtest day by day.
+
+---
+
 ## v2.2 (2026-11-03)
 
 Why: three losing weeks in a row (12–30 Oct), and a review of all 59 paper trades (3 Jul – 2 Nov).
