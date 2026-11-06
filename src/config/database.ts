@@ -141,28 +141,6 @@ class DbManager {
     }
   }
 
-  /**
-   * Runs one SELECT-shaped statement on every connected database (active first, then standby) and
-   * returns its first row per database. Bulk deletes are not copied by the per-row mirror hooks, so
-   * maintenance jobs (e.g. tick retention) use this to keep both databases the same.
-   */
-  async queryOnAll<T extends Record<string, unknown>>(sql: string, bind: unknown[] = []): Promise<{ label: DbLabel; row: T | null; error?: string }[]> {
-    const targets: [DbLabel, Sequelize][] = [[this.activeLabel, this.active]];
-    const standby = this.getStandby();
-    if (standby) targets.push([this.activeLabel === 'primary' ? 'secondary' : 'primary', standby]);
-
-    const results: { label: DbLabel; row: T | null; error?: string }[] = [];
-    for (const [label, conn] of targets) {
-      try {
-        const rows = await conn.query<T>(sql, { bind, type: QueryTypes.SELECT });
-        results.push({ label, row: rows[0] ?? null });
-      } catch (err) {
-        results.push({ label, row: null, error: String(err) });
-      }
-    }
-    return results;
-  }
-
   async close(): Promise<void> {
     this.stopHealthMonitor();
     await this.primary.close().catch(() => undefined);

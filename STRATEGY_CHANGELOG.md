@@ -52,8 +52,9 @@ Not entry/exit logic, shipped with it:
   volume, previous-day OI and delta per strike (Upstox `market_data` / `option_greeks` field names
   checked against the API docs), for spread, order-book imbalance and change-in-OI studies
   (~10–12 MB a month).
-- Raw index ticks (~70% of the database, ~7 MB a trading day) are deleted after
-  `MARKET_TICK_RETENTION_DAYS` (3) by a daily job outside market hours, on both databases.
+- Raw index ticks are kept forever (needed for backtesting). A 3-day tick cleanup job shipped in
+  46f53d9 and ran once on 6 Nov 08:40 IST before it was removed: it deleted 270,161 ticks older
+  than 3 Nov 08:40 IST from both databases.
 - Routine "no trade" decision rows (no signal, market hours, open position, cooldown, risk pause)
   are written when the reason changes and then at most every `STRATEGY_ROUTINE_LOG_MINUTES` (5);
   rows with a signal are always written. Was ~1,100 rows a day, 93% repeats.

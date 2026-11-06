@@ -2,7 +2,6 @@
 import app from './app';
 import { connectDatabase, dbManager } from './config/database';
 import { env } from './config/env';
-import { dataRetentionService } from './services/data-retention.service';
 import { marketDataService } from './services/market-data.service';
 import { marketStreamService } from './services/market-stream.service';
 import { stockCatalogService } from './services/stock-catalog.service';
@@ -24,7 +23,6 @@ const bootstrap = async (): Promise<void> => {
     marketStreamService.start();
     strategyService.start();
     tokenRenewalService.start();
-    dataRetentionService.start();
   } else {
     console.warn('[Boot] BACKGROUND_JOBS_ENABLED=false: API only (no market polling, strategy, execution monitor or token requests).');
   }
@@ -39,7 +37,6 @@ const bootstrap = async (): Promise<void> => {
     marketStreamService.stop();
     strategyService.stop();
     tokenRenewalService.stop();
-    dataRetentionService.stop();
     websocketService.close();
     await dbManager.close();
     server.close(() => {

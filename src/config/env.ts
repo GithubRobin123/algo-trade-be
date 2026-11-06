@@ -91,9 +91,6 @@ export const env = {
   // dashboard reads it); a finished row is cut down to ATM ± OPTION_CHAIN_HISTORY_STRIKES strikes.
   optionChainSnapshotMinutes: getNumber('OPTION_CHAIN_SNAPSHOT_MINUTES', 1),
   optionChainHistoryStrikes: getNumber('OPTION_CHAIN_HISTORY_STRIKES', 10),
-  // Raw index ticks older than this are deleted daily (strategy and candles only read today's ticks;
-  // ticks were ~70% of the database). 0 = keep forever.
-  marketTickRetentionDays: getNumber('MARKET_TICK_RETENTION_DAYS', 3),
   marketPollIntervalMs: getNumber('MARKET_POLL_INTERVAL_MS', 5000),
   // Real-time ticks over the Upstox WebSocket (Upstox allows 2 connections per user; each backend uses 1).
   // false = REST polling only (e.g. on an extra instance, to keep a connection free).
