@@ -1,7 +1,8 @@
-import { Op, col, where as sqlWhere } from 'sequelize';
+import { Op, col, fn, where as sqlWhere } from 'sequelize';
 import { StrategyDecisionLog } from '../models/strategy-decision-log.model';
 import { StrategyPosition } from '../models/strategy-position.model';
 import { TradeIntent } from '../models/trade-intent.model';
+import { positionCharges } from '../utils/charges';
 
 export interface TradeHistoryEntry {
   id: number;
@@ -20,6 +21,10 @@ export interface TradeHistoryEntry {
   targetPrice: number;
   exitReason: string | null;
   realizedPnl: number | null;
+  /** Estimated brokerage + taxes for the round trip (closed trades only); paper P&L is gross */
+  charges: number | null;
+  /** realizedPnl − charges */
+  netPnl: number | null;
   pnlPct: number | null;
   confidence: number | null;
   rationale: string | null;
@@ -76,6 +81,9 @@ export interface TradeSummaryStats {
   losses: number;
   winRatePct: number;
   totalRealizedPnl: number;
+  /** Estimated charges of the closed trades and the P&L after them */
+  totalCharges: number;
+  totalNetPnl: number;
   avgWin: number;
   avgLoss: number;
   strategyBreakdown: Record<string, { trades: number; pnl: number; wins: number }>;
@@ -155,6 +163,10 @@ class TradeHistoryService {
         pnlPct = (Number(pos.realizedPnl) / (entryPrice * pos.quantity)) * 100;
       }
 
+      const exitPrice = pos.status === 'CLOSED' && pos.currentPrice !== null ? Number(pos.currentPrice) : null;
+      const realizedPnl = pos.realizedPnl !== null ? Number(pos.realizedPnl) : null;
+      const charges = positionCharges(pos.side, entryPrice, exitPrice, pos.quantity);
+
       const optionType =
         decisionLog?.optionType ??
         (pos.symbol.endsWith('-CE') ? 'CALL' : pos.symbol.endsWith('-PE') ? 'PUT' : null);
@@ -174,14 +186,13 @@ class TradeHistoryService {
         side: pos.side,
         quantity: pos.quantity,
         entryPrice,
-        exitPrice:
-          pos.status === 'CLOSED' && pos.currentPrice !== null
-            ? Number(pos.currentPrice)
-            : null,
+        exitPrice,
         stopLossPrice: Number(pos.stopLossPrice),
         targetPrice: Number(pos.targetPrice),
         exitReason: pos.exitReason,
-        realizedPnl: pos.realizedPnl !== null ? Number(pos.realizedPnl) : null,
+        realizedPnl,
+        charges,
+        netPnl: realizedPnl !== null && charges !== null ? Math.round((realizedPnl - charges) * 100) / 100 : null,
         pnlPct,
         confidence:
           decisionLog?.confidence != null ? Number(decisionLog.confidence) : null,
@@ -244,7 +255,7 @@ class TradeHistoryService {
   async getTradeSummary(days = 30): Promise<TradeSummaryStats> {
     const start = new Date(Date.now() - Math.min(days, 365) * 24 * 60 * 60 * 1000);
 
-    const [positions, decisionLogs] = await Promise.all([
+    const [positions, decisionCounts] = await Promise.all([
       StrategyPosition.findAll({
         where: {
           [Op.or]: [
@@ -253,9 +264,13 @@ class TradeHistoryService {
           ],
         } as never,
       }),
+      // Counts per decision/category in the database (the table has ~1,100 rows a day before v2.3)
       StrategyDecisionLog.findAll({
+        attributes: ['decision', 'rejectionCategory', [fn('COUNT', col('id')), 'n']],
         where: { [Op.and]: [sqlWhere(col('created_at'), Op.gte, start)] } as never,
-      }),
+        group: ['decision', 'rejection_category'],
+        raw: true,
+      }) as unknown as Promise<{ decision: string; rejectionCategory: string | null; n: string | number }[]>,
     ]);
 
     const closed = positions.filter((p) => p.status === 'CLOSED');
@@ -291,13 +306,16 @@ class TradeHistoryService {
     }
 
     const decisionBreakdown: Record<string, number> = {};
-    for (const log of decisionLogs) {
+    for (const row of decisionCounts) {
       const key =
-        log.decision === 'REJECTED'
-          ? `REJECTED_${log.rejectionCategory ?? 'OTHER'}`
-          : log.decision;
-      decisionBreakdown[key] = (decisionBreakdown[key] ?? 0) + 1;
+        row.decision === 'REJECTED'
+          ? `REJECTED_${row.rejectionCategory ?? 'OTHER'}`
+          : row.decision;
+      decisionBreakdown[key] = (decisionBreakdown[key] ?? 0) + Number(row.n);
     }
+
+    const totalCharges = closed.reduce((s, p) => s + (positionCharges(
+      p.side, Number(p.entryPrice), p.currentPrice !== null ? Number(p.currentPrice) : null, p.quantity) ?? 0), 0);
 
     return {
       totalTrades: positions.length,
@@ -307,6 +325,8 @@ class TradeHistoryService {
       losses: losses.length,
       winRatePct: closed.length ? (wins.length / closed.length) * 100 : 0,
       totalRealizedPnl,
+      totalCharges: Math.round(totalCharges * 100) / 100,
+      totalNetPnl: Math.round((totalRealizedPnl - totalCharges) * 100) / 100,
       avgWin,
       avgLoss,
       strategyBreakdown,

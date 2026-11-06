@@ -14,7 +14,7 @@
  *   7. Wire real ATM call/put OI and IV from chain
  *   8. Use live India VIX (fetched alongside Nifty poll)
  *   9. Run strategy registry
- *  10. Rule-based probability pre-check
+ *  10. Rule-based probability pre-check, confidence gate, entry start (no entry before 10:30, v2.3)
  *  11. AI confidence check (optional)
  *  12. Create TradeIntent → hand off to execution.service
  *  13. Log every outcome to strategy_decision_logs
@@ -29,7 +29,7 @@ import { StrategyPosition } from '../models/strategy-position.model';
 import { PositionPnlTick } from '../models/position-pnl-tick.model';
 import { TradeIntent } from '../models/trade-intent.model';
 import { StrategyRiskSnapshot, StrategySignal } from '../types/trading.types';
-import { istClock } from '../utils/ist-clock';
+import { hhmmToMinutes, istClock } from '../utils/ist-clock';
 import { AiDecisionResult, getAiTradeDecision, selectByRules } from './ai-decision.service';
 import { executionService } from './execution.service';
 import { historicalCandleService } from './historical-candle.service';
@@ -74,10 +74,11 @@ function recordSignal(sym: string): void {
 const MIN_STRATEGY_CANDLES = 40;
 
 /** Version, deployed commit and the parameters that shape entries/exits, stamped on every decision and trade. */
-const strategyStamp = (): { strategyVersion: string; buildCommit: string | null; strategyParams: Record<string, number | boolean> } => ({
+const strategyStamp = (): { strategyVersion: string; buildCommit: string | null; strategyParams: Record<string, number | boolean | string> } => ({
   strategyVersion: env.strategyVersion,
   buildCommit: buildInfo?.commit ?? null,
   strategyParams: {
+    entryStartIst: env.strategyEntryStartIst,
     confidenceThreshold: env.strategyConfidenceThreshold,
     rulesGate: env.strategyRulesGateEnabled,
     gatePcr: env.strategyGatePcrEnabled,
@@ -133,7 +134,24 @@ interface DecisionLogInput {
   tradeOfDay?: number;
 }
 
+// Routine "no trade" rows (no signal attached: no signal, market hours, position open, cooldown, risk
+// pause) repeat every 20-s scan — ~1,100 rows a day, 93% of the table. Write one when the reason
+// changes, then at most once per STRATEGY_ROUTINE_LOG_MINUTES. Rows with a signal are always written.
+const lastRoutineLog = new Map<string, { key: string; at: number }>();
+
+function isRepeatedRoutineRow(input: DecisionLogInput): boolean {
+  const intervalMs = env.strategyRoutineLogMinutes * 60_000;
+  if (intervalMs <= 0 || input.decision !== 'REJECTED' || input.signalSource) return false;
+  const key = `${input.rejectionCategory ?? ''}|${(input.rejectionReason ?? '').replace(/\d+/g, '#')}`;
+  const now = Date.now();
+  const last = lastRoutineLog.get(input.underlying);
+  if (last && last.key === key && now - last.at < intervalMs) return true;
+  lastRoutineLog.set(input.underlying, { key, at: now });
+  return false;
+}
+
 async function logDecision(input: DecisionLogInput): Promise<void> {
+  if (isRepeatedRoutineRow(input)) return;
   try {
     await StrategyDecisionLog.create({
       underlying: input.underlying,
@@ -395,6 +413,23 @@ class StrategyService {
     if (signal.confidence < env.strategyConfidenceThreshold) {
       await logDecision({ underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'LOW_CONFIDENCE', rejectionReason: `Confidence ${(signal.confidence * 100).toFixed(1)}% < ${(env.strategyConfidenceThreshold * 100).toFixed(1)}%`, confidence: signal.confidence, signalSource: signal.source, rationale: signal.rationale, signalMetadata: signal.metadata, latencyMs: Date.now() - cycleStart });
       return { signal, intentId: null, logId: null, decisionSource: 'confidence-gate', strategyName };
+    }
+
+    // 8a. Entry start (v2.3): no new entry before STRATEGY_ENTRY_START_IST. In the 208-day backtest
+    // entries before 10:30 lost money in both halves (Jan–Jun and Jul–Nov), and live v2 trades
+    // before 10:30 went 1 win / 7 losses. The signal is still logged so skipped trades can be reviewed.
+    const entryStartMinutes = hhmmToMinutes(env.strategyEntryStartIst, 9 * 60 + 30);
+    if (minutesSinceOpen + (9 * 60 + 15) < entryStartMinutes) {
+      await logDecision({
+        underlying: sym, indexPrice: latestIndexPrice, decision: 'REJECTED', rejectionCategory: 'MARKET_HOURS',
+        rejectionReason: `Before entry start ${env.strategyEntryStartIst} IST — ${optionType} signal not traded`,
+        optionType, strikePrice: (meta.strike as number) ?? null, entryPremium: signal.entryPrice,
+        stopLossPrice: signal.suggestedStopLoss, targetPrice: signal.suggestedTarget, confidence: signal.confidence,
+        signalSource: signal.source, rationale: signal.rationale,
+        signalMetadata: { ...signal.metadata, ruleSignals: ruleResult.signals, strategyName, candidateVerdicts },
+        latencyMs: Date.now() - cycleStart,
+      });
+      return { signal, intentId: null, logId: null, decisionSource: 'entry-start', strategyName };
     }
 
     // 8b. Daily loss limit including this trade's planned stop-loss loss. The realized-only check

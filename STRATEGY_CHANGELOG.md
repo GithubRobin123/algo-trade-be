@@ -20,6 +20,60 @@ Rules for changes:
 
 ---
 
+## v2.3 (2026-11-05)
+
+Why: a cost-aware review (real NSE/Upstox charges, bid/ask spread and the stop-fill gap measured on
+live paper trades) showed the edge is thin, and only one entry filter held up in both halves of the
+backtest:
+- Live paper stop exits fill a median ₹0.25 (mean ₹0.40) below the stop price; the backtest filled
+  exactly at the stop. With real charges (~₹68 per lot), ₹0.10 spread per side and stops 0.3% worse,
+  v2.2.1 made +₹44,740 instead of +₹65,115 and broke even at only ~₹0.40 slippage per side.
+- Entries before 10:30 lost money in Jan–Jun and in Jul–Nov; live v2 trades before 10:30 went 1 win,
+  7 losses (−₹9,324). Starting at 10:30, 10:45 or 11:00 all beat 09:30 (a plateau, not one lucky
+  value); 10:00 and 10:15 did not.
+- Tested and rejected (realistic costs, both halves): only 10:30–13:30, no entry after 13:30 / 14:00
+  / 14:15, trade with the day's direction, ADX ≥ 25, VIX ≥ 12 (spiky across 11–14), no repeat entry
+  within 30 min, MACD not stretched and strong EMA gap (live winner patterns — fail Jul–Nov), max 1 /
+  2 / 3 trades a day (all worse; max 1 loses money).
+
+Change:
+- No new entry before `STRATEGY_ENTRY_START_IST` (default `10:30`). Signals before it are still
+  evaluated and logged as "Before entry start 10:30 IST — CALL/PUT signal not traded".
+- Backtest mirrors the entry start; `BACKTEST_REAL_CHARGES=1`, `BACKTEST_SLIPPAGE`,
+  `BACKTEST_STOP_SLIPPAGE_PCT` give cost-aware runs (defaults keep flat ₹60 / perfect fills).
+
+Not entry/exit logic, shipped with it:
+- Trade history, summary and daily P&L show estimated **Charges** and **Net P&L** (paper P&L stays
+  gross). `CHARGES_BROKERAGE_PER_ORDER` (20), `CHARGES_STT_SELL_PCT` (0.15).
+- Option-chain history fixed: every 30-s refresh used to move the newest snapshot's time forward, so
+  new rows only appeared after outages (24 days in four months). Now one row per
+  `OPTION_CHAIN_SNAPSHOT_MINUTES` (1); finished rows keep ATM ± `OPTION_CHAIN_HISTORY_STRIKES` (10)
+  strikes, the newest row keeps the full chain. Rows now also store bid/ask price and quantity,
+  volume, previous-day OI and delta per strike (Upstox `market_data` / `option_greeks` field names
+  checked against the API docs), for spread, order-book imbalance and change-in-OI studies
+  (~10–12 MB a month).
+- Raw index ticks (~70% of the database, ~7 MB a trading day) are deleted after
+  `MARKET_TICK_RETENTION_DAYS` (3) by a daily job outside market hours, on both databases.
+- Routine "no trade" decision rows (no signal, market hours, open position, cooldown, risk pause)
+  are written when the reason changes and then at most every `STRATEGY_ROUTINE_LOG_MINUTES` (5);
+  rows with a signal are always written. Was ~1,100 rows a day, 93% repeats.
+
+Backtest (1 Jan – 5 Nov, 209 sessions, same candles):
+
+| | v2.2.1 (from 09:30) | v2.3 (from 10:30) |
+|---|---|---|
+| Flat ₹60, perfect fills | +₹67,517, 490 trades, PF 1.35, max DD ₹12,458 | **+₹75,368**, 345 trades, PF 1.58, max DD ₹8,854 |
+| Real charges, ₹0.10 spread, stops 0.3% worse | +₹44,740, PF 1.22, max DD ₹13,985 | **+₹59,840**, PF 1.44, max DD ₹9,341 |
+
+Realistic costs by half: Jan–Jun ₹290 → ₹398 a day, Jul–Nov ₹112 → ₹136 a day. Break-even slippage
+rises from ~₹0.40 to ~₹0.90 per side; 10 of 11 months profitable (was 7); 20-day windows profitable
+77% (was 71%). Jul–Nov is still ~65% weaker than Jan–Jun: profit depends on volatile months.
+
+Deploy note: remove `INDIA_VIX_OVERRIDE=14` from the production `.env` — it pins live VIX at 14, so
+the gate's "VIX > 22" discount can never fire live (the backtest uses real VIX).
+
+---
+
 ## v2.2.1 (2026-11-04)
 
 Why: the rules gate added ±8 for PCR (put/call OI of ±10 strikes around ATM: < 0.8 → +8 bear,

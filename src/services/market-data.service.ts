@@ -54,8 +54,16 @@ export function setLiveVix(vix: number): void {
 // While the WebSocket delivered the index within this window, the REST poll skips the index tick
 const STREAM_FRESH_MS = 10_000;
 
-// ── Option chain snapshot: only insert if last snapshot is >4 min old ─────
-const MIN_CHAIN_SNAPSHOT_GAP_MS = 4 * 60 * 1000;
+/** The `count` strikes either side of the strike nearest `spot` (all rows when spot is unknown). */
+export function rowsNearAtm(rows: NormalizedOptionChainRow[], spot: number | null, count: number): NormalizedOptionChainRow[] {
+  if (spot === null || !rows.length || count <= 0) return rows;
+  const sorted = [...rows].sort((a, b) => a.strikePrice - b.strikePrice);
+  let atm = 0;
+  for (let i = 1; i < sorted.length; i++) {
+    if (Math.abs(sorted[i].strikePrice - spot) < Math.abs(sorted[atm].strikePrice - spot)) atm = i;
+  }
+  return sorted.slice(Math.max(0, atm - count), atm + count + 1);
+}
 
 // Calendar date in IST (YYYY-MM-DD)
 const istToday = (): string => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
@@ -317,7 +325,7 @@ class MarketDataService {
     return expiries;
   }
 
-  /** Fetch and store option chain. Inserts a new snapshot (not upsert) if last one is >4 min old. */
+  /** Fetch the option chain (cached for OPTION_CHAIN_REFRESH_MS) and store it in the snapshot history. */
   async fetchAndStoreOptionChain(
     expiryDate?: string,
     symbolOrInstrument?: string,
@@ -354,7 +362,13 @@ class MarketDataService {
     return normalized;
   }
 
-  /** Inserts a new snapshot row (history preserved). */
+  /**
+   * One snapshot row per OPTION_CHAIN_SNAPSHOT_MINUTES bucket (per expiry). The newest row is kept
+   * current with the full chain (the dashboard reads it); when its bucket ends it is cut down to
+   * ATM ± OPTION_CHAIN_HISTORY_STRIKES strikes and a new row starts.
+   * Before v2.3 every refresh moved the newest row's snapshotTime forward, so a new row only started
+   * after a > 4 min gap between refreshes: 24 days of history in four months, ~3 rows a day.
+   */
   private async insertOptionChainSnapshot(normalized: NormalizedOptionChain): Promise<void> {
     const latest = await OptionChainSnapshot.findOne({
       where: {
@@ -364,19 +378,27 @@ class MarketDataService {
       order: [['snapshotTime', 'DESC']],
     });
 
-    const ageMs = latest
-      ? Date.now() - new Date(latest.snapshotTime).getTime()
-      : Infinity;
+    const bucketMs = Math.max(1, env.optionChainSnapshotMinutes) * 60_000;
+    // createdAt never moves (snapshotTime does), so it marks when the newest row's bucket began
+    const bucketAgeMs = latest ? Date.now() - new Date(latest.createdAt).getTime() : Infinity;
 
-    if (ageMs < MIN_CHAIN_SNAPSHOT_GAP_MS) {
-      // Update the most-recent row instead of inserting a new one (rate-limit inserts)
-      if (latest) {
-        latest.underlyingPrice = normalized.underlyingPrice;
-        latest.snapshotTime = new Date(normalized.snapshotTime);
-        latest.chainRows = normalized.rows;
+    // Inside the bucket, or outside market hours (dashboard views at night): refresh the newest row
+    if (latest && (bucketAgeMs < bucketMs || !isMarketOpen())) {
+      latest.underlyingPrice = normalized.underlyingPrice;
+      latest.snapshotTime = new Date(normalized.snapshotTime);
+      latest.chainRows = normalized.rows;
+      await latest.save();
+      return;
+    }
+
+    // Bucket over: keep only the strikes near ATM in the finished row, then start a new full row
+    if (latest) {
+      const spot = latest.underlyingPrice !== null ? Number(latest.underlyingPrice) : null;
+      const nearAtm = rowsNearAtm(latest.chainRows, spot, env.optionChainHistoryStrikes);
+      if (nearAtm.length < latest.chainRows.length) {
+        latest.chainRows = nearAtm;
         await latest.save();
       }
-      return;
     }
 
     await OptionChainSnapshot.create({
@@ -495,6 +517,21 @@ class MarketDataService {
       iv: toNumber(callGreeks.iv) ?? toNumber(putGreeks.iv) ?? toNumber(callMarket.iv) ?? toNumber(putMarket.iv) ?? toNumber(row.iv),
       callInstrumentKey: (callNode.instrument_key as string | undefined) ?? (callNode.instrumentKey as string | undefined) ?? null,
       putInstrumentKey: (putNode.instrument_key as string | undefined) ?? (putNode.instrumentKey as string | undefined) ?? null,
+      // Field names per Upstox docs (GET /v2/option/chain → market_data / option_greeks)
+      callBid: toNumber(callMarket.bid_price),
+      callBidQty: toNumber(callMarket.bid_qty),
+      callAsk: toNumber(callMarket.ask_price),
+      callAskQty: toNumber(callMarket.ask_qty),
+      callVolume: toNumber(callMarket.volume),
+      callPrevOi: toNumber(callMarket.prev_oi),
+      callDelta: toNumber(callGreeks.delta),
+      putBid: toNumber(putMarket.bid_price),
+      putBidQty: toNumber(putMarket.bid_qty),
+      putAsk: toNumber(putMarket.ask_price),
+      putAskQty: toNumber(putMarket.ask_qty),
+      putVolume: toNumber(putMarket.volume),
+      putPrevOi: toNumber(putMarket.prev_oi),
+      putDelta: toNumber(putGreeks.delta),
     };
   }
 

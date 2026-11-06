@@ -23,6 +23,23 @@ export interface NormalizedOptionChainRow {
   iv: number | null;
   callInstrumentKey: string | null;
   putInstrumentKey: string | null;
+  // Stored from v2.3 (Nov 2026) for spread, order-book imbalance and change-in-OI research; absent in
+  // older snapshots. Upstox /v2/option/chain market_data: bid_price, bid_qty, ask_price, ask_qty,
+  // volume, prev_oi; option_greeks: delta.
+  callBid?: number | null;
+  callBidQty?: number | null;
+  callAsk?: number | null;
+  callAskQty?: number | null;
+  callVolume?: number | null;
+  callPrevOi?: number | null;
+  callDelta?: number | null;
+  putBid?: number | null;
+  putBidQty?: number | null;
+  putAsk?: number | null;
+  putAskQty?: number | null;
+  putVolume?: number | null;
+  putPrevOi?: number | null;
+  putDelta?: number | null;
 }
 
 export interface NormalizedOptionChain {

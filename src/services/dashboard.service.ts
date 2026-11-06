@@ -1,4 +1,5 @@
 import { Op } from 'sequelize';
+import { positionCharges } from '../utils/charges';
 import { PositionPnlTick } from '../models/position-pnl-tick.model';
 import { StrategyDecisionLog } from '../models/strategy-decision-log.model';
 import { StrategyPosition } from '../models/strategy-position.model';
@@ -124,11 +125,12 @@ export class DashboardService {
       order: [['updatedAt', 'ASC']],
     });
 
-    const map = new Map<string, { day: string; pnl: number; wins: number; losses: number; trades: number }>();
+    // pnl = paper P&L (gross); charges = estimated brokerage + taxes; netPnl = pnl − charges
+    const map = new Map<string, { day: string; pnl: number; charges: number; netPnl: number; wins: number; losses: number; trades: number }>();
 
     for (let i = daysBack - 1; i >= 0; i--) {
       const day = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      map.set(day, { day, pnl: 0, wins: 0, losses: 0, trades: 0 });
+      map.set(day, { day, pnl: 0, charges: 0, netPnl: 0, wins: 0, losses: 0, trades: 0 });
     }
 
     for (const pos of positions) {
@@ -136,7 +138,10 @@ export class DashboardService {
       const row = map.get(day);
       if (!row) continue;
       const pnl = pos.realizedPnl !== null ? Number(pos.realizedPnl) : 0;
+      const charges = positionCharges(pos.side, Number(pos.entryPrice), pos.currentPrice !== null ? Number(pos.currentPrice) : null, pos.quantity) ?? 0;
       row.pnl += pnl;
+      row.charges = Math.round((row.charges + charges) * 100) / 100;
+      row.netPnl = Math.round((row.pnl - row.charges) * 100) / 100;
       row.trades += 1;
       if (pnl > 0) row.wins += 1;
       else row.losses += 1;

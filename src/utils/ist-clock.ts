@@ -25,3 +25,12 @@ export function istClock(at: Date = new Date()): {
     weekday: ist.getUTCDay(),
   };
 }
+
+/** "HH:MM" → minutes since midnight; `fallback` when the text is not a valid time. */
+export function hhmmToMinutes(text: string, fallback: number): number {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(text.trim());
+  if (!match) return fallback;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  return hour < 24 && minute < 60 ? hour * 60 + minute : fallback;
+}

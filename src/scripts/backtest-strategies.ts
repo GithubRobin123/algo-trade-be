@@ -16,7 +16,12 @@
  * live), and IV = IV_PER_VIX × India VIX at that time. IV_PER_VIX = 0.94 is the median implied
  * IV / VIX of the 41 real paper trades (Jul–Oct 2026); it prices their entries with a median error
  * of 0% (p10 −9%, p90 +20%). The earlier flat model (0.45% of spot, delta 0.5, no theta) was off by
- * a median −20%. No bid/ask spread or slippage; charges are a flat ₹60 per trade.
+ * a median −20%. By default no bid/ask spread or slippage and a flat ₹60 of charges per trade, so
+ * results compare with earlier runs. Cost-aware runs (v2.3 review, Nov 2026):
+ *   BACKTEST_REAL_CHARGES=1        NSE/Upstox charges per trade (utils/charges.ts, ~₹68 per lot)
+ *   BACKTEST_SLIPPAGE=0.10         ₹ worse fill on each side (bid/ask spread; paper fills at LTP)
+ *   BACKTEST_STOP_SLIPPAGE_PCT=0.3 stop exits fill this % below the stop (live paper median: 0.2–0.3%)
+ * The v2.3 entry start (STRATEGY_ENTRY_START_IST, default 10:30) is applied as live.
  * Needs no Upstox token or database (the candle API is public).
  */
 
@@ -34,6 +39,8 @@ import {
   supertrend,
 } from '../services/strategy-registry.service';
 import { upstoxService } from '../services/upstox.service';
+import { estimateOptionCharges } from '../utils/charges';
+import { hhmmToMinutes } from '../utils/ist-clock';
 
 const INSTRUMENT_KEY = 'NSE_INDEX|Nifty 50';
 const VIX_KEY = 'NSE_INDEX|India VIX';
@@ -43,6 +50,9 @@ const STRIKE_STEP = 50;
 const IV_PER_VIX = 0.94;
 const DEFAULT_VIX = 14;
 const CHARGES_PER_ROUND_TRIP = 60;
+const REAL_CHARGES = process.env.BACKTEST_REAL_CHARGES === '1';
+const SLIPPAGE = Math.max(0, Number(process.env.BACKTEST_SLIPPAGE ?? 0));
+const STOP_SLIPPAGE_PCT = Math.max(0, Number(process.env.BACKTEST_STOP_SLIPPAGE_PCT ?? 0));
 const WARMUP_SESSIONS = env.strategyWarmupSessions;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
@@ -90,7 +100,7 @@ interface OpenPosition {
 /** A backtest variant: env overrides for the live rules (keys as in env.ts). */
 interface Variant {
   name: string;
-  env: Partial<Record<keyof typeof env, number | boolean>>;
+  env: Partial<Record<keyof typeof env, number | boolean | string>>;
 }
 
 const istDay = (ms: number): string => new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 10);
@@ -310,9 +320,14 @@ function runVariant(variant: Variant, market: Market): Trade[] {
         optionPrice(p.side, index, p.strike, (p.expiryMs - at) / YEAR_MS, (IV_PER_VIX * vixAt(at)) / 100);
 
       const close = (p: OpenPosition, at: number, index: number, premium: number, reason: string): void => {
-        const pnl = (premium - p.premiumEntry) * LOT_SIZE - CHARGES_PER_ROUND_TRIP;
+        // Fills: paper fills at LTP; real orders pay the spread, and stops fill below the stop price
+        const buyFill = p.premiumEntry + SLIPPAGE;
+        const stopGap = reason === 'STOP_LOSS_HIT' ? premium * (STOP_SLIPPAGE_PCT / 100) : 0;
+        const sellFill = Math.max(0.05, premium - SLIPPAGE - stopGap);
+        const charges = REAL_CHARGES ? estimateOptionCharges(buyFill, sellFill, LOT_SIZE).total : CHARGES_PER_ROUND_TRIP;
+        const pnl = (sellFill - buyFill) * LOT_SIZE - charges;
         dayPnl += pnl;
-        if (premium < p.premiumEntry) { lastLossAt = at; lossesToday += 1; } // live counts gross losses (realizedPnl < 0)
+        if (sellFill < buyFill) { lastLossAt = at; lossesToday += 1; } // live counts gross losses (realizedPnl < 0)
         // A stop that was moved past the entry is reported as a trail or breakeven stop, as live
         const label = reason === 'STOP_LOSS_HIT' && p.stopLoss > p.premiumEntry
           ? (p.trailActive ? 'TRAIL_STOP_HIT' : 'BREAKEVEN_STOP_HIT') : reason;
@@ -380,6 +395,8 @@ function runVariant(variant: Variant, market: Market): Trade[] {
 
         const signal = entrySignal(market, day, warm, five, bar, now);
         if (!signal) continue;
+        // v2.3 entry start: the signal is evaluated (as live) but not traded before this time
+        if (minute < hhmmToMinutes(env.strategyEntryStartIst, 9 * 60 + 30)) continue;
         const plannedLoss = (signal.premium - signal.stopLoss) * LOT_SIZE + CHARGES_PER_ROUND_TRIP;
         if (env.strategyDailyLossIncludesNextRisk && dayPnl - plannedLoss <= dailyLossLimit) continue;
 
@@ -427,16 +444,11 @@ function summarise(trades: Trade[]): Record<string, unknown> {
   };
 }
 
-// v2.1.1 = the rules and production settings before v2.2; each v2.2 change alone, then the code defaults (v2.2 + .env)
-const V211: Variant['env'] = {
-  strategySlMinPct: 10, strategyTrailOffsetPct: 6, strategyMaxLossesPerDay: 0, strategyDailyLossIncludesNextRisk: false,
-};
+// v2.2.1 = the rules before v2.3 (entries from 09:30); then the code defaults (v2.3 + .env).
+// Earlier version comparisons are recorded in STRATEGY_CHANGELOG.md.
 const VARIANTS: Variant[] = [
-  { name: 'v2.1.1', env: V211 },
-  { name: 'v2.1.1 + stop min 8%, trail 5%', env: { ...V211, strategySlMinPct: 8, strategyTrailOffsetPct: 5 } },
-  { name: 'v2.1.1 + max 3 losing trades', env: { ...V211, strategyMaxLossesPerDay: 3 } },
-  { name: 'v2.1.1 + loss limit incl. next trade', env: { ...V211, strategyDailyLossIncludesNextRisk: true } },
-  { name: 'v2.2 (code defaults)', env: {} },
+  { name: 'v2.2.1 (entries from 09:30)', env: { strategyEntryStartIst: '09:30' } },
+  { name: 'v2.3 (code defaults: entries from 10:30)', env: {} },
 ];
 
 async function main(): Promise<void> {

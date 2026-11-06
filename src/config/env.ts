@@ -87,6 +87,13 @@ export const env = {
   optionChainExpiryDate: getString('OPTION_CHAIN_EXPIRY_DATE', ''),
   // How often the option chain is re-fetched from Upstox (DB snapshots are still rate-limited separately).
   optionChainRefreshMs: getNumber('OPTION_CHAIN_REFRESH_MS', 30000),
+  // Option chain history: one DB row per this many minutes. The newest row keeps the full chain (the
+  // dashboard reads it); a finished row is cut down to ATM ± OPTION_CHAIN_HISTORY_STRIKES strikes.
+  optionChainSnapshotMinutes: getNumber('OPTION_CHAIN_SNAPSHOT_MINUTES', 1),
+  optionChainHistoryStrikes: getNumber('OPTION_CHAIN_HISTORY_STRIKES', 10),
+  // Raw index ticks older than this are deleted daily (strategy and candles only read today's ticks;
+  // ticks were ~70% of the database). 0 = keep forever.
+  marketTickRetentionDays: getNumber('MARKET_TICK_RETENTION_DAYS', 3),
   marketPollIntervalMs: getNumber('MARKET_POLL_INTERVAL_MS', 5000),
   // Real-time ticks over the Upstox WebSocket (Upstox allows 2 connections per user; each backend uses 1).
   // false = REST polling only (e.g. on an extra instance, to keep a connection free).
@@ -95,6 +102,12 @@ export const env = {
 
   strategyEnabled: getBoolean('STRATEGY_ENABLED', true),
   strategyScanIntervalMs: getNumber('STRATEGY_SCAN_INTERVAL_MS', 20000),
+  // No new entry before this IST time (HH:MM). Signals before it are still evaluated and logged as
+  // "not traded". v2.3: entries before 10:30 lost in the 208-day backtest (both halves) and live.
+  strategyEntryStartIst: getString('STRATEGY_ENTRY_START_IST', '10:30'),
+  // Routine "no trade" decision rows (no signal, market hours, position open, …) are written when the
+  // reason changes and then at most once per this many minutes (0 = every scan, as before v2.3).
+  strategyRoutineLogMinutes: getNumber('STRATEGY_ROUTINE_LOG_MINUTES', 5),
   strategyMaxAutoTradesPerDay: getNumber('STRATEGY_MAX_AUTO_TRADES_PER_DAY', 2),
   strategyDailyMaxLossPct: getNumber('STRATEGY_DAILY_MAX_LOSS_PCT', 5),
   // true = the daily loss limit also counts the next trade's planned stop-loss loss, so a new
@@ -127,7 +140,7 @@ export const env = {
   strategyWarmupSessions: getNumber('STRATEGY_WARMUP_SESSIONS', 2),
   // Stamped on every decision, intent and position so results can be compared per version.
   // Bump it in code whenever entry/exit logic changes (env parameters are stamped separately).
-  strategyVersion: 'v2.2.1',
+  strategyVersion: 'v2.3',
   // How long a strategy intent waits for manual approval before it expires
   intentExpiryMinutes: getNumber('INTENT_EXPIRY_MINUTES', 2),
 
@@ -150,6 +163,12 @@ export const env = {
 
   // India VIX — can be overridden manually if live fetch is not set up yet
   indiaVixOverride: getNumber('INDIA_VIX_OVERRIDE', 0),
+
+  // Estimated charges per option trade (shown as Charges / Net P&L; paper P&L itself is gross).
+  // Brokerage ₹ per executed order and STT % of the sell-side premium; exchange, SEBI, GST and
+  // stamp duty use the fixed NSE rates in utils/charges.ts.
+  chargesBrokeragePerOrder: getNumber('CHARGES_BROKERAGE_PER_ORDER', 20),
+  chargesSttSellPct: getNumber('CHARGES_STT_SELL_PCT', 0.15),
 } as const;
 
 export const isProduction = env.nodeEnv === 'production';
